@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wilga – Gra</title>
+  <style>
+    html, body { height:100%; margin:0; background:#0b0f18; }
+    body {
+      display:flex;
+      justify-content:center;
+      align-items:center;
+    }
+    canvas {
+      display:block;
+      touch-action:none;
+    }
+  </style>
+</head>
+<body>
+
+  <canvas id="game" width="1000" height="1000"></canvas>
+
+  <script src="rtl.js"></script>
+  <script>
+    window.Module = { canvas: document.getElementById('game') };
+  </script>
+  <script src="main.js"></script>
+  <script>
+    if (window.rtl?.run) rtl.run();
+    else if (window.main) main();
+  </script>
+
+</body>
+</html>
