@@ -7,7 +7,7 @@ unit wilga_font_scope;
 interface
 
 uses
-  SysUtils, wilga, wilga_extras;
+  SysUtils,wilga;
 
 type
   // Anonimowy callback (pas2js/FPC): WithFont('Pacifico', procedure ... end);

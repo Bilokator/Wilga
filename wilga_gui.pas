@@ -4,7 +4,7 @@ unit wilga_gui;
 interface
 
 uses
-  JS, Web, SysUtils, Math, wilga;
+  JS, Web, SysUtils, Math, wilga,wilga_font_scope;
 
 type
   TWidget = class;
@@ -19,6 +19,7 @@ type
   TListBox = class;
 
   TWidgetState = (wsNormal, wsHover, wsActive, wsDisabled, wsDragging, wsFocused);
+  TOrientation = (orVertical, orHorizontal);
   TWidgetCallback = procedure(widget: TWidget) of object;
   TListBoxItemEvent = procedure(widget: TWidget; index: Integer; item: String) of object;
 
@@ -71,7 +72,7 @@ constructor Create(ax, ay, aw, ah: Double); virtual;
     TextColor: TColor;
     FontSize: Integer;
     Icon: TTexture;
-
+    FontName: String; // <<< NOWE
     constructor Create(ax, ay, aw, ah: Double); override;
     procedure Update; override;
     procedure Draw; override;
@@ -84,7 +85,7 @@ constructor Create(ax, ay, aw, ah: Double); virtual;
     FontSize: Integer;
     Align: String; // 'left', 'center', 'right'
     WordWrap: Boolean;
-
+    FontName: String; // <<< DODAJ TO
     procedure Draw; override;
   end;
 
@@ -97,7 +98,7 @@ constructor Create(ax, ay, aw, ah: Double); virtual;
     SliderColor: TColor;
     OnChange: TWidgetCallback;
     ShowValue: Boolean;
-
+     FontName: String; // <<< NOWE
     procedure Draw; override;
     procedure Update; override;
   end;
@@ -112,7 +113,7 @@ constructor Create(ax, ay, aw, ah: Double); virtual;
     Color: TColor;
     CheckColor: TColor;
     FontSize: Integer;
-
+    fontname:string;
     constructor Create(ax, ay, aw, ah: Double); override;
     procedure Draw; override;
     procedure Update; override;
@@ -134,7 +135,7 @@ public
   ShowCaret: Boolean;
   BackspaceHeld: Boolean;
   LastBackspaceTime:  double;
-
+  FontName: String; // <<< NOWE
 constructor Create(ax, ay, aw, ah: Double); override;
 
 
@@ -153,7 +154,7 @@ end;
     BackgroundColor: TColor;
     FillColor: TColor;
     ShowPercentage: Boolean;
-
+    FontName: String; // <<< NOWE
     procedure Draw; override;
   end;
 
@@ -168,7 +169,7 @@ end;
     FontSize: Integer;
     OnSelect: TListBoxItemEvent;
     ScrollOffset: Integer;
-
+     FontName: String; // <<< NOWE
     constructor Create(ax, ay, aw, ah: Double); override;
     procedure Draw; override;
     procedure Update; override;
@@ -191,6 +192,36 @@ end;
     procedure ClearChildren;
     procedure OffsetChildren(dx, dy: Double);
   end;
+  TStackPanel = class(TPanel)
+  public
+    Orientation: TOrientation;
+    Spacing: Double;
+    PaddingLeft, PaddingTop, PaddingRight, PaddingBottom: Double;
+    constructor Create(ax, ay, aw, ah: Double); override;
+    procedure Update; override;
+  end;
+
+  { ---------- ScrollPanel (panel z pionowym scrollowaniem) ---------- }
+  { ---------- ScrollPanel (panel z pionowym scrollowaniem) ---------- }
+  TScrollPanel = class(TPanel)
+  private
+    FDraggingThumb: Boolean;
+    FDragOffsetY: Double;
+    function HasScrollbar: Boolean;
+    procedure GetScrollbarGeometry(out barX, barY, barW, barH, maxScroll: Double);
+  public
+    ScrollY: Double;         // bieżąca pozycja scrolla (0 = top)
+    ScrollSpeed: Double;     // ile pikseli na "krok kółka"
+    ShowScrollBar: Boolean;  // czy rysować pasek przewijania
+    ScrollbarWidth: Double;  // szerokość paska przewijania
+    ContentHeight: Double;   // wysokość zawartości (do ustawienia przez użytkownika)
+    constructor Create(ax, ay, aw, ah: Double); override;
+    procedure Update; override;
+    procedure Draw; override;
+    procedure ScrollBy(dy: Double);
+    procedure SetScrollY(value: Double);
+  end;
+
 
   { ---------- Window ---------- }
   TWindow = class(TWidget)
@@ -209,7 +240,7 @@ end;
     MinimizeButton: TButton;
     ContentPanel: TPanel;
     Minimized: Boolean;
-
+    FontName: String;  // <<< NOWE POLE
     constructor Create(ax, ay, aw, ah: Double); override;
     procedure Update; override;
     procedure Draw; override;
@@ -386,7 +417,7 @@ begin
   // Hover/Active wizualnie (bez klików)
   if isHover then
   begin
-    if IsMouseButtonDown(0) then
+    if IsMouseButtonpressed(0) then
       State := wsActive
     else if State <> wsHover then
     begin
@@ -417,6 +448,7 @@ ColorNormal := COLOR_GRAY;
   TextColor := COLOR_WHITE;
   FontSize := 16;
   InPress := False;
+  FontName := ''; // pusty = użyj domyślnego fontu
 end;
 
 procedure TButton.Update;
@@ -435,7 +467,7 @@ begin
 
   if not InPress then
   begin
-    if isHover and IsMouseButtonPressed(0) then
+    if isHover and IsMouseButtondown(0) then
     begin
       InPress := True;
       State := wsActive;
@@ -479,6 +511,39 @@ procedure TButton.Draw;
 var
   col: TColor;
   center: TInputVector;
+
+  procedure DrawButtonText;
+  begin
+    if TextureIsReady(Icon) then
+    begin
+      DrawTexture(
+        Icon,
+        Round(Bounds.x + 5),
+        Round(Bounds.y + (Bounds.height - Icon.height) / 2),
+        TextColor
+      );
+      center := RectCenter(Bounds);
+      DrawTextCentered(
+        Text,
+        Round(center.x + Icon.width / 2),
+        Round(center.y),
+        FontSize,
+        TextColor
+      );
+    end
+    else
+    begin
+      center := RectCenter(Bounds);
+      DrawTextCentered(
+        Text,
+        Round(center.x),
+        Round(center.y),
+        FontSize,
+        TextColor
+      );
+    end;
+  end;
+
 begin
   if not Visible then Exit;
 
@@ -492,17 +557,14 @@ begin
 
   DrawRectangleRoundedRec(Bounds, 5, col, True);
 
-  if TextureIsReady(Icon) then
-  begin
-    DrawTexture(Icon, Round(Bounds.x + 5), Round(Bounds.y + (Bounds.height - Icon.height) / 2), TextColor);
-    center := RectCenter(Bounds);
-    DrawTextCentered(Text, Round(center.x + Icon.width/2), Round(center.y), FontSize, TextColor);
-  end
+  // <<< TU JEST MAGIA FONTU
+  if FontName <> '' then
+    WithFont(FontName, procedure
+    begin
+      DrawButtonText;
+    end)
   else
-  begin
-    center := RectCenter(Bounds);
-    DrawTextCentered(Text, Round(center.x), Round(center.y), FontSize, TextColor);
-  end;
+    DrawButtonText;
 end;
 
 { ===== TLabel ===== }
@@ -511,43 +573,56 @@ procedure TLabel.Draw;
 var
   pos: TInputVector;
   x, y: Integer;
+
+  procedure DrawInner;
+  begin
+    pos := RectCenter(Bounds);
+
+    if Align = 'left' then
+      pos.x := Bounds.x
+    else if Align = 'right' then
+      pos.x := Bounds.x + Bounds.width;
+
+    x := Round(pos.x);
+    y := Round(pos.y);
+
+    if WordWrap then
+      DrawTextBoxed(
+        Text,
+        NewVector(Bounds.x, Bounds.y),
+        Round(Bounds.width),
+        FontSize,
+        Color,
+        5,
+        COLOR_Red,
+        3
+      )
+    else
+    begin
+      if Align = 'left' then
+        DrawText(Text, x, y, FontSize, Color)
+      else if Align = 'right' then
+      begin
+        x := x - Round(MeasureTextWidth(Text, FontSize));
+        DrawText(Text, x, y, FontSize, Color);
+      end
+      else
+        DrawTextCentered(Text, x, y, FontSize, Color);
+    end;
+  end;
+
 begin
   if not Visible then Exit;
 
-  pos := RectCenter(Bounds);
-
-  if Align = 'left' then
-    pos.x := Bounds.x
-  else if Align = 'right' then
-    pos.x := Bounds.x + Bounds.width;
-
-  x := Round(pos.x);
-  y := Round(pos.y);
-
-  if WordWrap then
-    DrawTextBoxed(
-  Text,
-  NewVector(Bounds.x, Bounds.y),
-  Round(Bounds.width),
-  FontSize,
-  Color,
-  5,
-  COLOR_Red,
-  3
-)
-  else
-  begin
-    if Align = 'left' then
-      DrawText(Text, x, y, FontSize, Color)
-    else if Align = 'right' then
+  if FontName <> '' then
+    WithFont(FontName, procedure
     begin
-      x := x - Round(MeasureTextWidth(Text, FontSize));
-      DrawText(Text, x, y, FontSize, Color);
-    end
-    else
-      DrawTextCentered(Text, x, y, FontSize, Color);
-  end;
+      DrawInner;
+    end)
+  else
+    DrawInner;
 end;
+
 
 { ===== TSlider ===== }
 
@@ -556,48 +631,92 @@ var
   fillWidth, handlePos: Double;
   handleRect: TRectangle;
   valueText: String;
+  cx, cy: Integer;
 begin
   if not Visible then Exit;
 
+  // tło suwaka
   DrawRectangleRoundedRec(Bounds, 3, BackgroundColor, True);
 
+  // wypełnienie
   fillWidth := Map(Value, MinValue, MaxValue, 0, Bounds.width);
   fillWidth := Clamp(fillWidth, 0, Bounds.width);
-  DrawRectangleRoundedRec(RectangleCreate(Bounds.x, Bounds.y, fillWidth, Bounds.height), 3, SliderColor, True);
+  DrawRectangleRoundedRec(
+    RectangleCreate(Bounds.x, Bounds.y, fillWidth, Bounds.height),
+    3, SliderColor, True
+  );
 
+  // „gałka”
   handlePos := Map(Value, MinValue, MaxValue, Bounds.x, Bounds.x + Bounds.width);
   handleRect := RectangleCreate(handlePos - 5, Bounds.y - 2, 10, Bounds.height + 4);
   DrawRectangleRoundedRec(handleRect, 5, COLOR_WHITE, True);
 
-  if ShowValue then
-  begin
-    valueText := FormatFloat('0.##', Value);
-    DrawText(valueText, Round(handlePos - MeasureTextWidth(valueText, 12)/2), Round(Bounds.y - 15), 12, COLOR_WHITE);
-  end;
+  // wartość – rysowana stabilnie w środku suwaka
+if ShowValue then
+begin
+  valueText := FormatFloat('0.##', Value);
+  cx := Round(Bounds.x + Bounds.width / 2);
+  cy := Round(Bounds.y + Bounds.height / 2);
+
+  if FontName <> '' then
+    WithFont(FontName, procedure
+    begin
+      DrawTextCentered(valueText, cx, cy, 12, COLOR_WHITE);
+    end)
+  else
+    DrawTextCentered(valueText, cx, cy, 12, COLOR_WHITE);
 end;
+end;
+{ ===== TSlider ===== }
 
 procedure TSlider.Update;
 var
   mp: TInputVector;
   newValue: Double;
+  isHover: Boolean;
 begin
-  inherited Update;
-  // Keyboard navigation when focused
-  if GUI.FocusedWidget = Self then
+  if not Visible or not Enabled then Exit;
+
+  mp := GetMousePosition;
+  isHover := ContainsPoint(mp);
+
+  // Jeśli ktoś inny trzyma capture — nie reagujemy
+  if Assigned(GUI.MouseCapturedBy) and (GUI.MouseCapturedBy <> Self) then
+    Exit;
+
+  // Aktywacja slidera na kliknięcie
+  if (State <> wsActive) and isHover and IsMouseButtonPressed(0) then
   begin
+    State := wsActive;
+    GUI.MouseCapturedBy := Self; // Przechwytujemy mysz
   end;
 
+  // Przeciąganie slidera
   if State = wsActive then
   begin
-    mp := GetMousePosition;
     newValue := Map(mp.x, Bounds.x, Bounds.x + Bounds.width, MinValue, MaxValue);
     newValue := Clamp(newValue, MinValue, MaxValue);
 
-    if newValue <> Value then
+    if Abs(newValue - Value) > 0.001 then
     begin
       Value := newValue;
       if Assigned(OnChange) then OnChange(Self);
     end;
+
+    // Zwolnienie slidera po puszczeniu przycisku
+    if not IsMouseButtonDown(0) then
+    begin
+      State := wsNormal;
+      GUI.MouseCapturedBy := nil; // Zwolnij capture
+    end;
+  end
+  else
+  begin
+    // Standardowa logika hover
+    if isHover then
+      State := wsHover
+    else
+      State := wsNormal;
   end;
 end;
 
@@ -618,17 +737,32 @@ procedure TCheckbox.Draw;
 var
   boxRect: TRectangle;
   textPos: TInputVector;
+
+  procedure DrawTextInner;
+  begin
+    textPos := NewVector(Bounds.x + Bounds.height + 5, Bounds.y);
+    DrawText(Text, Round(textPos.x), Round(textPos.y), FontSize, Color);
+  end;
+
 begin
   if not Visible then Exit;
 
+  // pudełko checkboxa
   boxRect := RectangleCreate(Bounds.x, Bounds.y, Bounds.height, Bounds.height);
   DrawRectangleRoundedRec(boxRect, 3, Color, True);
 
+  // ptaszek
   if Checked then
     DrawRectangleRoundedRec(RectInflate(boxRect, -4, -4), 2, CheckColor, True);
 
-  textPos := NewVector(Bounds.x + Bounds.height + 5, Bounds.y);
-  DrawText(Text, Round(textPos.x), Round(textPos.y), FontSize, Color);
+  // tekst – Pacifico jeśli ustawiony
+  if FontName <> '' then
+    WithFont(FontName, procedure
+    begin
+      DrawTextInner;
+    end)
+  else
+    DrawTextInner;
 end;
 
 procedure TCheckbox.Update;
@@ -647,7 +781,7 @@ begin
 
   if not InPress then
   begin
-    if isHover and IsMouseButtonPressed(0) then
+    if isHover and IsMouseButtondown(0) then
     begin
       InPress := True;
       State := wsActive;
@@ -679,6 +813,40 @@ var
   textToDraw: String;
   textX, textY: Integer;
   caretX, topY, bottomY: Integer;
+
+  procedure DrawTextAndCaret;
+  begin
+    // tylko wizual: tekst/placeholder
+    if (Text = '') and (Placeholder <> '') then
+      textToDraw := Placeholder
+    else
+      textToDraw := Text;
+
+    textX := Round(Bounds.x + 6);
+    textY := Round(Bounds.y + Bounds.height/2 - (FontSize div 2));
+    DrawText(textToDraw, textX, textY, FontSize, TextColor);
+
+    // caret blinking + draw
+    if State = wsFocused then
+    begin
+      CaretBlink := CaretBlink + GetDeltaTime;
+      if CaretBlink >= 0.5 then
+      begin
+        ShowCaret := not ShowCaret;
+        CaretBlink := 0.0;
+      end;
+      if ShowCaret then
+      begin
+        if CaretPos < 0 then CaretPos := 0;
+        if CaretPos > Length(Text) then CaretPos := Length(Text);
+        caretX := textX + Round(MeasureTextWidth(Copy(Text,1,CaretPos), FontSize));
+        topY := textY;
+        bottomY := textY + FontSize;
+        DrawLine(caretX, topY, caretX, bottomY, COLOR_BLACK, 1);
+      end;
+    end;
+  end;
+
 begin
   if not Visible then Exit;
 
@@ -691,37 +859,16 @@ begin
                        Round(Bounds.width), Round(Bounds.height),
                        COLOR_YELLOW, 2);
 
-  // tylko wizual: tekst/placeholder
-  if (Text = '') and (Placeholder <> '') then
-    textToDraw := Placeholder
+  // tekst + caret w wybranym foncie
+  if FontName <> '' then
+    WithFont(FontName, procedure
+    begin
+      DrawTextAndCaret;
+    end)
   else
-    textToDraw := Text;
-
-  textX := Round(Bounds.x + 6);
-  textY := Round(Bounds.y + Bounds.height/2 - (FontSize div 2));
-  DrawText(textToDraw, textX, textY, FontSize, TextColor);
-
-  // caret blinking + draw
-  if State = wsFocused then
-  begin
-    CaretBlink := CaretBlink + GetDeltaTime;
-    if CaretBlink >= 0.5 then
-    begin
-      ShowCaret := not ShowCaret;
-      CaretBlink := 0.0;
-    end;
-    if ShowCaret then
-    begin
-      if CaretPos < 0 then CaretPos := 0;
-      if CaretPos > Length(Text) then CaretPos := Length(Text);
-       caretX := textX + Round(MeasureTextWidth(Copy(Text,1,CaretPos), FontSize));
-       topY := textY;
-      bottomY := textY + FontSize;
-      DrawLine(caretX, topY, caretX, bottomY, COLOR_BLACK, 1);
-    end;
-  end;
-
+    DrawTextAndCaret;
 end;
+
 constructor TTextBox.Create(ax, ay, aw, ah: Double);
 begin
   inherited Create(ax, ay, aw, ah);
@@ -737,6 +884,8 @@ Text := '';
   ShowCaret := True;
   BackspaceHeld := False;
   LastBackspaceTime := Gettime;
+    FontName := '';
+
 end;
 
 
@@ -937,21 +1086,40 @@ end;
 procedure TProgressBar.Draw;
 var
   fillWidth: Double;
+  percent, clamped: Double;
   percentText: String;
+  cx, cy: Integer;
 begin
   if not Visible then Exit;
 
+  // tło
   DrawRectangleRoundedRec(Bounds, 3, BackgroundColor, True);
 
+  // wypełnienie
   fillWidth := Map(Value, MinValue, MaxValue, 0, Bounds.width);
   fillWidth := Clamp(fillWidth, 0, Bounds.width);
-  DrawRectangleRoundedRec(RectangleCreate(Bounds.x, Bounds.y, fillWidth, Bounds.height), 3, FillColor, True);
+  DrawRectangleRoundedRec(
+    RectangleCreate(Bounds.x, Bounds.y, fillWidth, Bounds.height),
+    3, FillColor, True
+  );
 
-  if ShowPercentage and (MaxValue <> 0) then
+  // napis z procentem
+  if ShowPercentage and (MaxValue > MinValue) then
   begin
-    percentText := FormatFloat('0%', (Value/MaxValue) * 100);
-    DrawTextCentered(percentText, Round(Bounds.x + Bounds.width/2),
-                     Round(Bounds.y + Bounds.height/2 - 8), 12, COLOR_WHITE);
+    percent := (Value - MinValue) / (MaxValue - MinValue);
+    clamped := Clamp(percent * 100.0, 0.0, 100.0);
+    percentText := FormatFloat('0.##"%"', clamped);
+
+    cx := Round(Bounds.x + Bounds.width / 2);
+    cy := Round(Bounds.y + Bounds.height / 2);
+
+    if FontName <> '' then
+      WithFont(FontName, procedure
+      begin
+        DrawTextCentered(percentText, cx, cy, 12, COLOR_WHITE);
+      end)
+    else
+      DrawTextCentered(percentText, cx, cy, 12, COLOR_WHITE);
   end;
 end;
 
@@ -968,6 +1136,8 @@ ItemHeight := 20;
   FontSize := 12;
   SelectedIndex := -1;
   ScrollOffset := 0;
+    FontName := '';
+
 end;
 
 procedure TListBox.Draw;
@@ -975,6 +1145,18 @@ var
   i, yPos: Integer;
   itemRect: TRectangle;
   visibleItems, maxVisible: Integer;
+
+  procedure DrawItemText(const AText: String; AY: Integer);
+  begin
+    if FontName <> '' then
+      WithFont(FontName, procedure
+      begin
+        DrawText(AText, Round(Bounds.x + 5), AY + 2, FontSize, TextColor);
+      end)
+    else
+      DrawText(AText, Round(Bounds.x + 5), AY + 2, FontSize, TextColor);
+  end;
+
 begin
   if not Visible then Exit;
 
@@ -998,7 +1180,7 @@ begin
     if (i + ScrollOffset) = SelectedIndex then
       DrawRectangleRoundedRec(itemRect, 0, SelectionColor, True);
 
-    DrawText(Items[i + ScrollOffset], Round(Bounds.x + 5), yPos + 2, FontSize, TextColor);
+    DrawItemText(Items[i + ScrollOffset], yPos);
   end;
 end;
 
@@ -1210,9 +1392,267 @@ begin
   for i := 0 to High(Children) do
     if Assigned(Children[i]) then
     begin
+      // przesuwamy bezpośrednie dziecko
       Children[i].Bounds.x := Children[i].Bounds.x + dx;
       Children[i].Bounds.y := Children[i].Bounds.y + dy;
+
+      // jeśli dziecko jest panelem (Panel/Window/ScrollPanel/StackPanel itd.),
+      // to przesuwamy również jego dzieci
+      if Children[i] is TPanel then
+        TPanel(Children[i]).OffsetChildren(dx, dy);
     end;
+end;
+
+
+{ ===== TStackPanel ===== }
+
+constructor TStackPanel.Create(ax, ay, aw, ah: Double);
+begin
+  inherited Create(ax, ay, aw, ah);
+  Orientation := orVertical;
+  Spacing := 8.0;
+  PaddingLeft := 8.0;
+  PaddingTop := 8.0;
+  PaddingRight := 8.0;
+  PaddingBottom := 8.0;
+end;
+
+procedure TStackPanel.Update;
+var
+  i: Integer;
+  ch: TWidget;
+  cx, cy, availW, availH: Double;
+begin
+  // najpierw układamy dzieci
+  cx := Bounds.x + PaddingLeft;
+  cy := Bounds.y + PaddingTop;
+  availW := Max(0, Bounds.width  - (PaddingLeft + PaddingRight));
+  availH := Max(0, Bounds.height - (PaddingTop  + PaddingBottom));
+
+  for i := 0 to High(Children) do
+  begin
+    ch := Children[i];
+    if (ch = nil) or (not ch.Visible) then
+      Continue;
+
+    if Orientation = orVertical then
+    begin
+      ch.Bounds.x := Bounds.x + PaddingLeft;
+      ch.Bounds.y := cy;
+      ch.Bounds.width := availW;
+      cy := cy + ch.Bounds.height + Spacing;
+    end
+    else
+    begin
+      ch.Bounds.x := cx;
+      ch.Bounds.y := Bounds.y + PaddingTop;
+      ch.Bounds.height := availH;
+      cx := cx + ch.Bounds.width + Spacing;
+    end;
+  end;
+
+  // potem standardowa logika Panelu (hover, Update dzieci)
+  inherited Update;
+end;
+{ ===== TScrollPanel ===== }
+{ ===== TScrollPanel ===== }
+
+function TScrollPanel.HasScrollbar: Boolean;
+begin
+  Result := ShowScrollBar and (ContentHeight > Bounds.height);
+end;
+
+procedure TScrollPanel.GetScrollbarGeometry(out barX, barY, barW, barH, maxScroll: Double);
+var
+  scrollRatio: Double;
+begin
+  barW := ScrollbarWidth;
+
+  if ContentHeight < Bounds.height then
+    maxScroll := 0.0
+  else
+    maxScroll := ContentHeight - Bounds.height;
+
+  if maxScroll < 0 then
+    maxScroll := 0;
+
+  // wysokość "thumb" zależna od proporcji widocznego obszaru
+  if ContentHeight <= 0 then
+    barH := Bounds.height
+  else
+    barH := Bounds.height * (Bounds.height / ContentHeight);
+
+  if barH < 16 then
+    barH := 16; // minimalny rozmiar
+
+  if maxScroll <= 0 then
+    scrollRatio := 0
+  else
+    scrollRatio := ScrollY / maxScroll;
+
+  if scrollRatio < 0 then scrollRatio := 0
+  else if scrollRatio > 1 then scrollRatio := 1;
+
+  barX := Bounds.x + Bounds.width - barW;
+  barY := Bounds.y + scrollRatio * (Bounds.height - barH);
+end;
+
+constructor TScrollPanel.Create(ax, ay, aw, ah: Double);
+begin
+  inherited Create(ax, ay, aw, ah);
+  ScrollY := 0.0;
+  ScrollSpeed := 32.0;
+  ShowScrollBar := True;
+  ScrollbarWidth := 8.0;
+  ContentHeight := ah; // domyślnie tyle co panel – użytkownik może nadpisać
+  FDraggingThumb := False;
+  FDragOffsetY := 0.0;
+end;
+
+procedure TScrollPanel.SetScrollY(value: Double);
+var
+  maxScroll, newY, delta: Double;
+begin
+  if ContentHeight < Bounds.height then
+    maxScroll := 0.0
+  else
+    maxScroll := ContentHeight - Bounds.height;
+
+  if maxScroll < 0 then
+    maxScroll := 0;
+
+  newY := value;
+  if newY < 0 then
+    newY := 0;
+  if newY > maxScroll then
+    newY := maxScroll;
+
+  delta := newY - ScrollY;
+  if Abs(delta) < 0.01 then
+    Exit;
+
+  ScrollY := newY;
+
+  // przesuwamy wszystkie dzieci wizualnie o -delta (skrolowanie w górę/dół)
+  OffsetChildren(0, -delta);
+end;
+
+procedure TScrollPanel.ScrollBy(dy: Double);
+begin
+  SetScrollY(ScrollY + dy);
+end;
+
+procedure TScrollPanel.Draw;
+var
+  i: Integer;
+  clipX, clipY, clipW, clipH: Integer;
+  barX, barY, barW, barH, maxScroll: Double;
+begin
+  if not Visible then
+    Exit;
+
+  // tło panelu (jak w TPanel.Draw)
+  DrawRectangleRoundedRec(Bounds, 5, Color, True);
+
+  if BorderWidth > 0 then
+    DrawRectangleLines(
+      Round(Bounds.x), Round(Bounds.y),
+      Round(Bounds.width), Round(Bounds.height),
+      BorderColor, BorderWidth
+    );
+
+  // obszar clipowania – całe wnętrze panelu
+  clipX := Round(Bounds.x);
+  clipY := Round(Bounds.y);
+  clipW := Round(Bounds.width);
+  clipH := Round(Bounds.height);
+
+  BeginScissor(clipX, clipY, clipW, clipH);
+  try
+    // rysujemy dzieci przycięte do panelu
+    for i := 0 to High(Children) do
+      if Assigned(Children[i]) then
+        Children[i].Draw;
+  finally
+    EndScissor;
+  end;
+
+  // Pasek przewijania
+  if HasScrollbar then
+  begin
+    GetScrollbarGeometry(barX, barY, barW, barH, maxScroll);
+
+    DrawRectangle(
+      Round(barX), Round(barY),
+      Round(barW), Round(barH),
+      COLOR_DARKGRAY
+    );
+  end;
+end;
+
+
+procedure TScrollPanel.Update;
+var
+  mp: TInputVector;
+  wheel: Integer;
+  barX, barY, barW, barH, maxScroll: Double;
+  scrollRatio, newBarY: Double;
+begin
+  mp := GetMousePosition;
+
+  // 1) Scroll kółkiem – tylko gdy kursor nad panelem
+  if ContainsPoint(mp) then
+  begin
+    wheel := GetMouseWheelMove;
+    if wheel <> 0 then
+      ScrollBy(-wheel * ScrollSpeed);
+  end;
+
+  // 2) Przeciąganie paska mysza
+  if HasScrollbar then
+  begin
+    GetScrollbarGeometry(barX, barY, barW, barH, maxScroll);
+
+    // Start przeciągania: klik w obszar thumb'a
+    if IsMouseButtonPressed(0) then
+    begin
+      if (mp.x >= barX) and (mp.x <= barX + barW) and
+         (mp.y >= barY) and (mp.y <= barY + barH) then
+      begin
+        FDraggingThumb := True;
+        FDragOffsetY := mp.y - barY; // gdzie w thumbie złapaliśmy
+      end;
+    end;
+
+    // Ruch podczas trzymania
+    if FDraggingThumb and IsMouseButtonDown(0) then
+    begin
+      newBarY := mp.y - FDragOffsetY;
+
+      // clamp w obrębie paska
+      if newBarY < Bounds.y then
+        newBarY := Bounds.y;
+      if newBarY > Bounds.y + Bounds.height - barH then
+        newBarY := Bounds.y + Bounds.height - barH;
+
+      // przeliczamy pozycję thumb'a na ScrollY
+      if maxScroll <= 0 then
+        scrollRatio := 0
+      else
+        scrollRatio := (newBarY - Bounds.y) / (Bounds.height - barH);
+
+      SetScrollY(scrollRatio * maxScroll);
+    end;
+
+    // Koniec przeciągania – puszczenie przycisku
+    if FDraggingThumb and (not IsMouseButtonDown(0)) then
+      FDraggingThumb := False;
+  end
+  else
+    FDraggingThumb := False;
+
+  // 3) Reszta logiki widgetu (stany hover/active, dzieci itd.)
+  inherited Update;
 end;
 
 { ===== TWindow ===== }
@@ -1228,6 +1668,7 @@ begin
   PrevHeight := ah;
   PrevWinX := ax;
   PrevWinY := ay;
+FontName := '';
 
   // Close
   CloseButton := TButton.Create(Bounds.x + Bounds.width - 25, Bounds.y + 5, 20, 20);
@@ -1386,15 +1827,31 @@ end;
 procedure TWindow.Draw;
 var
   titleBarRect: TRectangle;
+  titleX, titleY: Integer;
+
+  procedure DrawTitle;
+  begin
+    if FontName <> '' then
+      WithFont(FontName, procedure
+      begin
+        DrawText(Title, titleX, titleY, 14, COLOR_WHITE);
+      end)
+    else
+      DrawText(Title, titleX, titleY, 14, COLOR_WHITE);
+  end;
+
 begin
   if not Visible then Exit;
+
+  titleX := Round(Bounds.x + 10);
+  titleY := Round(Bounds.y + TitleBarHeight/2 - 8);
 
   if not Minimized then
   begin
     DrawRectangleRoundedRec(Bounds, 5, COLOR_GRAY, True);
     titleBarRect := RectangleCreate(Bounds.x, Bounds.y, Bounds.width, TitleBarHeight);
     DrawRectangleRoundedRec(titleBarRect, 5, TitleColor, True);
-    DrawText(Title, Round(Bounds.x + 10), Round(Bounds.y + TitleBarHeight/2 - 8), 14, COLOR_WHITE);
+    DrawTitle;
     CloseButton.Draw;
     MinimizeButton.Draw;
     ContentPanel.Draw;
@@ -1403,11 +1860,12 @@ begin
   begin
     titleBarRect := RectangleCreate(Bounds.x, Bounds.y, Bounds.width, TitleBarHeight);
     DrawRectangleRoundedRec(titleBarRect, 5, TitleColor, True);
-    DrawText(Title, Round(Bounds.x + 10), Round(Bounds.y + TitleBarHeight/2 - 8), 14, COLOR_WHITE);
+    DrawTitle;
     CloseButton.Draw;
     MinimizeButton.Draw;
   end;
 end;
+
 
 procedure TWindow.AddChild(widget: TWidget);
 begin

@@ -41,6 +41,7 @@ type
   TProc = procedure;               // fallback dla innych kompilatorów
   {$endif}
 
+
 type
   { Prosty PRNG (xorshift32) dla powtarzalnych wyników }
   TXorShift32 = record
@@ -90,6 +91,14 @@ type
 procedure SpriteInit(out s: TSprite; const tex: TTexture);
 procedure SpriteDraw(const s: TSprite);
 procedure SpriteSetFrame(var s: TSprite; const src: TRectangle);
+// Małe, uniwersalne helpery do pracy ze sprite'ami
+procedure SpriteCenterOrigin(var s: TSprite); inline;
+
+procedure SpriteSetPos(var s: TSprite; const p: TInputVector); inline; overload;
+procedure SpriteSetPos(var s: TSprite; x, y: Double); inline; overload;
+
+procedure SpriteSetScale(var s: TSprite; const p: TInputVector); inline; overload;
+procedure SpriteSetScale(var s: TSprite; x, y: Double); inline; overload;
 
 
 function WilgaSupportsOffscreen(const Canvas: TJSHTMLCanvasElement): Boolean;
@@ -257,7 +266,10 @@ procedure LoadBIN (const url: String; const onReady: TOnBytes);
 type
   // callback bez argumentów, pozwala przekazywać procedury anonimowe
   TNoArgCallback = reference to procedure;
-
+var
+  gTextFillCanvas: TJSHTMLCanvasElement = nil;
+  gTextFillCtx: TJSCanvasRenderingContext2D = nil;
+procedure EnsureTextFillCanvas(w, h: Integer);
 procedure InjectCss(const css: String);
 function  ExtToMime(const Url: string): string;
 function  ExtToFormat(const Url: string): string;
@@ -266,6 +278,19 @@ function  FontIsLoaded(const CssFont: string): Boolean;
 procedure StartFontLoad(const Sample: string);
 procedure LoadWebFont(const Family, Url: string; OnReady: TNoArgCallback = nil);
 procedure UseWebFont(const Family: string; SizePx: Integer);
+
+//lighting
+// lighting
+function W_LightColorFromTemperature(temp: Double): TColor;
+procedure W_ClearLights;
+procedure W_AddLight(const pos: TVector2; radius: Double;
+  intensity: Double = 1.0; color: TColor = COLOR_WHITE);
+procedure W_AddLightTemp(const pos: TVector2; radius: Double;
+  intensity, temperature: Double);
+procedure W_ApplyLighting(ambientAlpha: Byte = 220);
+
+{ ==== Arcade Physics + one-way + triggery ================================== }
+
 { ==== Arcade Physics + one-way + triggery ================================== }
 type
   TRigidBody = record
@@ -305,6 +330,37 @@ procedure SceneReplace(const s: IScene);
 procedure SceneUpdate(const dt: Double);
 procedure SceneDraw(const dt: Double);
 
+type
+  TSpriteAnimClip = record
+    name      : String;
+    frameNames: array of String;
+    loop      : Boolean;
+  end;
+
+  TSpriteAnimator = record
+    sheet          : TSpriteSheet;
+    animator       : TAnimator;
+    clips          : array of TSpriteAnimClip;
+    currentClipIdx : Integer;
+    nextFrameId    : Integer;
+  end;
+type
+  TWilgaLight = record
+    position : TVector2;
+    radius   : Double;
+    intensity: Double; // 0..1
+    color    : TColor;
+  end;
+
+
+procedure SpriteAnimInit(var SA: TSpriteAnimator; const tex: TTexture);
+procedure SpriteAnimAddStrip(var SA: TSpriteAnimator; var spr: TSprite;
+  const clipName: String; frameCount, framesPerRow: Integer; fps: Double;
+  loop: Boolean = True; startFrameIndex: Integer = 0);
+procedure SpriteAnimPlay(var SA: TSpriteAnimator; const clipName: String);
+procedure SpriteAnimStop(var SA: TSpriteAnimator);
+procedure SpriteAnimUpdate(var SA: TSpriteAnimator; var spr: TSprite; const dt: Double);
+procedure SpriteAnimFree(var SA: TSpriteAnimator);
 
 { ==== Input Map ============================================================= }
 type
@@ -408,7 +464,8 @@ procedure DrawStar(cx, cy: Double; points: Integer; rOuter, rInner: Double;
   rotationDeg: Double; const color: TColor; filled: Boolean = True; thickness: Integer = 1);
 procedure DrawStarV(center: TVector2; points: Integer; rOuter, rInner: Double;
   rotationDeg: Double; const color: TColor; filled: Boolean = True; thickness: Integer = 1);
-
+procedure DrawTriangleStrip(const pts: array of TInputVector; const color: TColor;
+  filled: Boolean = True; thickness: Integer = 1);
 procedure DrawHeart(cx, cy: Double; width, height: Double; rotationDeg: Double;
   const color: TColor; filled: Boolean = True; thickness: Integer = 1; samples: Integer = 120);
 procedure DrawHeartV(center: TVector2; width, height: Double; rotationDeg: Double;
@@ -428,6 +485,110 @@ function RadtoDeg(const A: Double): Double; inline;
 procedure EnsureBatchCap(need: Integer);
 
 implementation
+
+var
+  gLights: array of TWilgaLight;
+
+function W_LightColorFromTemperature(temp: Double): TColor;
+var
+  t    : Double;
+  warmR, warmG, warmB: Integer;
+  coldR, coldG, coldB: Integer;
+  r,g,b: Integer;
+begin
+  // ograniczamy zakres
+  if temp < 0 then temp := 0
+  else if temp > 1 then temp := 1;
+
+  // kolor "ciepły" (0) i "zimny" (1) – możesz sobie dobrać inne
+  warmR := 255; warmG := 200; warmB := 120; // coś jak 3000K
+  coldR := 180; coldG := 200; coldB := 255; // coś jak 8000K
+
+  r := Round(warmR + (coldR - warmR) * temp);
+  g := Round(warmG + (coldG - warmG) * temp);
+  b := Round(warmB + (coldB - warmB) * temp);
+
+  Result := ColorRGBA(r, g, b, 255);
+end;
+procedure W_AddLight(const pos: TVector2; radius: Double;
+  intensity: Double = 1.0; color: TColor = COLOR_WHITE);
+var
+  n: Integer;
+begin
+  n := Length(gLights);
+  SetLength(gLights, n + 1);
+  gLights[n].position  := pos;
+  gLights[n].radius    := radius;
+  gLights[n].intensity := intensity;
+  gLights[n].color     := color;
+end;
+
+procedure W_AddLightTemp(const pos: TVector2; radius: Double;
+  intensity: Double; temperature: Double);
+begin
+  W_AddLight(pos, radius, intensity, W_LightColorFromTemperature(temperature));
+end;
+
+function ColorToCSS(const c: TColor): String;
+begin
+  // TColor w Wildze ma pola r,g,b,a: Integer
+  Result :=
+    'rgba(' +
+    IntToStr(c.r) + ',' +
+    IntToStr(c.g) + ',' +
+    IntToStr(c.b) + ',1)';
+end;
+
+procedure W_ClearLights;
+begin
+  SetLength(gLights, 0);
+end;
+
+procedure W_ApplyLighting(ambientAlpha: Byte = 220);
+var
+  ctx   : TJSCanvasRenderingContext2D;
+  w, h  : Integer;
+  i     : Integer;
+  light : TWilgaLight;
+  grad  : TJSCanvasGradient;
+begin
+  ctx := gCtx;            // globalny context Wilgi
+  w := GetScreenWidth;    // albo Twoje funkcje/zmienne
+  h := GetScreenHeight;
+
+canvassave;
+  // 1. przyciemniamy cały ekran
+  ctx.globalCompositeOperation := 'source-over';
+  ctx.globalAlpha := ambientAlpha / 255;
+  ctx.fillStyle := 'black';
+  ctx.fillRect(0, 0, w, h);
+
+  // 2. jasne światła – dodajemy je trybem "screen"
+  ctx.globalCompositeOperation := 'screen';
+
+  for i := 0 to High(gLights) do
+  begin
+    light := gLights[i];
+
+    ctx.globalAlpha := light.intensity;
+
+    grad := ctx.createRadialGradient(
+      light.position.x, light.position.y, 0,
+      light.position.x, light.position.y, light.radius
+    );
+
+    // zakładam, że masz ColorToCSS(TColor)
+    grad.addColorStop(0.0, ColorToCSS(light.color));
+    grad.addColorStop(1.0, 'rgba(0,0,0,0)');
+
+    ctx.fillStyle := grad;
+    ctx.beginPath;
+    ctx.arc(light.position.x, light.position.y, light.radius, 0, 2*PI);
+    ctx.fill;
+  end;
+
+  ctx.restore;
+end;
 
 
 function RectInflated(const r: TRectangle; pad: Double): TRectangle; inline;
@@ -544,6 +705,31 @@ begin
   s.flipX := False; s.flipY := False;
   s.z := 0;
   s.src := RectangleCreate(0,0,tex.width, tex.height);
+end;
+procedure SpriteCenterOrigin(var s: TSprite); inline;
+begin
+  // origin jest relatywny (0..1), więc środek to (0.5, 0.5)
+  s.origin := NewVector(0.5, 0.5);
+end;
+
+procedure SpriteSetPos(var s: TSprite; const p: TInputVector); inline;
+begin
+  s.position := p;
+end;
+
+procedure SpriteSetPos(var s: TSprite; x, y: Double); inline;
+begin
+  s.position := NewVector(x, y);
+end;
+
+procedure SpriteSetScale(var s: TSprite; const p: TInputVector); inline;
+begin
+  s.scale := p;
+end;
+
+procedure SpriteSetScale(var s: TSprite; x, y: Double); inline;
+begin
+  s.scale := NewVector(x, y);
 end;
 
 procedure SpriteSetFrame(var s: TSprite; const src: TRectangle);
@@ -1482,6 +1668,22 @@ begin
 
   tries := 0;
   if Assigned(OnReady) then Poll;
+
+  // 🔥 HARD MODE: powiedz workerowi, żeby też załadował font
+  asm
+    try {
+      var worker = window.__wilgaRenderWorker;
+      if (worker) {
+        worker.postMessage({
+          type: "loadFont",
+          family: Family,
+          url: Url
+        });
+      }
+    } catch (e) {
+      // ign
+    }
+  end;
 end;
 
 procedure UseWebFont(const Family: string; SizePx: Integer);
@@ -2211,32 +2413,44 @@ end;
 procedure DrawTextTextureFill(const text: String; pos: TVector2; fontSize: Integer; const tex: TTexture);
 var
   textW, textH: Double;
-  offCanvas: TJSHTMLCanvasElement;
-  offCtx: TJSCanvasRenderingContext2D;
-  tw, th: Integer; // realne wymiary bufora tekstury (Offscreen lub zwykły)
-  dstW, dstH: Integer;
+  tw, th      : Integer;
+  dstW, dstH  : Integer;
+  fontStr     : String;
 begin
+  // zabezpieczenia
+  if (text = '') or (fontSize <= 0) then Exit;
   if not TextureIsReady(tex) then Exit;
 
-  // zmierz rozmiar tekstu (docelowy rozmiar w pikselach bufora)
+  // Upewnij się, że Wilga ma ustawiony poprawny font (uwzględnia WithFont / zewnętrzne czcionki)
+  EnsureFont(fontSize);
+  fontStr := gCtx.font;   // dokładnie ten sam CSS font, którego używa DrawText / MeasureText*
+
+  // zmierz tekst w pikselach (Wilga używa tego samego mechanizmu co DrawText)
   textW := MeasureTextWidth(text, fontSize);
   textH := MeasureTextHeight(text, fontSize);
-  dstW := Round(textW);
-  dstH := Round(textH);
 
-  // utwórz lokalny bufor (zwykły canvas – NIE używamy WilgaInitContextFromCanvas)
-  offCanvas := TJSHTMLCanvasElement(document.createElement('canvas'));
-  offCanvas.width := dstW;
-  offCanvas.height := dstH;
-  offCtx := TJSCanvasRenderingContext2D(offCanvas.getContext('2d'));
+  // + padding, żeby nie ucinało końcowych liter / ogonków
+  dstW := Ceil(textW) + 4;  // możesz zwiększyć do 6–8 jakby dalej coś ciachało
+  dstH := Ceil(textH) + 4;
+  if (dstW <= 0) or (dstH <= 0) then Exit;
 
-  // narysuj tekst jako maskę
-  offCtx.font := IntToStr(fontSize) + 'px Arial, Helvetica, sans-serif';
-  offCtx.textBaseline := 'top';
-  offCtx.fillStyle := 'white';
-  offCtx.fillText(text, 0, 0);
+  // stały helper-canvas pod tekst
+  EnsureTextFillCanvas(dstW, dstH);
 
-  // pobierz bezpiecznie realny rozmiar źródłowej tekstury
+  // wyczyść i ustaw stan kontekstu
+  gTextFillCtx.setTransform(1, 0, 0, 1, 0, 0);
+  gTextFillCtx.globalAlpha := 1;
+  gTextFillCtx.globalCompositeOperation := 'source-over';
+  gTextFillCtx.clearRect(0, 0, dstW, dstH);
+
+  // maska – biały tekst, ale z TYM SAMYM fontem co reszta Wilgi
+  gTextFillCtx.font := fontStr;
+  gTextFillCtx.textBaseline := 'top';
+  gTextFillCtx.textAlign := 'left';
+  gTextFillCtx.fillStyle := 'white';
+  gTextFillCtx.fillText(text, 0, 0);
+
+  // rozmiar źródłowej tekstury (uwzględnia ewentualny offscreen)
   asm
     var cnv = tex.canvas;
     var off = cnv && cnv.__wilgaOffscreen ? cnv.__wilgaOffscreen : null;
@@ -2244,13 +2458,22 @@ begin
     th = (off ? off.height : cnv.height);
   end;
 
-  // source-in: kolor z tekstury, alfa z tekstu
-  offCtx.globalCompositeOperation := 'source-in';
-  offCtx.drawImage(tex.canvas, 0, 0, tw, th, 0, 0, dstW, dstH);
+  // nałóż teksturę przez "source-in"
+  gTextFillCtx.globalCompositeOperation := 'source-in';
+  gTextFillCtx.drawImage(tex.canvas, 0, 0, tw, th, 0, 0, dstW, dstH);
 
-  // narysuj gotowy obraz na głównym canvasie
-  gCtx.drawImage(offCanvas, pos.x, pos.y);
+  // zarejestruj helper-canvas w workerze (jak gTintCanvas)
+  W_RegisterHelperCanvas(gTextFillCanvas);
+
+  // rysowanie na ekran (proxy → worker)
+  gCtx.drawImage(gTextFillCanvas, pos.x, pos.y);
+
+  // przywróć domyślny tryb mieszania dla helpera
+  gTextFillCtx.globalCompositeOperation := 'source-over';
 end;
+
+
+
 
 function GetTextureByName(const name: String): TTexture;
 var i: Integer; dummy: TTexture; key, cur: String;
@@ -2604,6 +2827,35 @@ begin
     x += MeasureTextWidth(ch, fontSize);
   end;
 end;
+procedure DrawTriangleStrip(const pts: array of TInputVector; const color: TColor;
+  filled: Boolean; thickness: Integer);
+var
+  i: Integer;
+  tri: TTriangle;
+begin
+  // potrzebujemy minimum 3 punktów
+  if Length(pts) < 3 then Exit;
+
+  if not filled then
+    gCtx.lineWidth := thickness;
+
+  // triangle strip:
+  // (p0, p1, p2), (p1, p2, p3), (p2, p3, p4), ...
+  for i := 0 to High(pts) - 2 do
+  begin
+    // ostatni poprawny start to High(pts) - 2,
+    // czyli i = 0 .. (Length(pts) - 3)
+    if i + 2 > High(pts) then Break;
+
+    tri.p1 := pts[i];
+    tri.p2 := pts[i + 1];
+    tri.p3 := pts[i + 2];
+
+    DrawTriangle(tri, color, filled);
+  end;
+end;
+
+
 // ===== Gwiazda =====
 procedure DrawStarV(center: TVector2; points: Integer; rOuter, rInner: Double;
   rotationDeg: Double; const color: TColor; filled: Boolean; thickness: Integer);
@@ -2649,75 +2901,6 @@ end;
 // x = 16 sin^3(t)
 // y = 13 cos t - 5 cos 2t - 2 cos 3t - cos 4t
 // Rysowanie przerywanej polilinii (pomocnicze)
-procedure DrawDashedPolyline(const pts: array of TInputVector; const color: TColor;
-  thickness: Integer; dashLen, gapLen: Double; closed: Boolean);
-var
-  n, i: Integer;
-  iNext: Integer;
-  ax, ay, bx, by, dx, dy, segLen, leftInSeg: Double;
-  patLeft: Double;
-  drawPhase: Boolean; // True = rysujemy kreskę, False = przerwa
-  ux, uy: Double;
-  startX, startY, stepLen: Double;
-  segPts: array[0..1] of TInputVector;
-begin
-  n := Length(pts);
-  if n < 2 then Exit;
-  if dashLen <= 0 then dashLen := 4.0;
-  if gapLen <= 0 then gapLen := 4.0;
-
-  drawPhase := True;           // start od kreski
-  patLeft := dashLen;          // ile zostało w aktualnej fazie (kreska/przerwa)
-
-  for i := 0 to n - 1 do
-  begin
-    if (i = n - 1) and (not closed) then Break;
-    iNext := (i + 1) mod n;
-
-    ax := pts[i].x;  ay := pts[i].y;
-    bx := pts[iNext].x; by := pts[iNext].y;
-
-    dx := bx - ax; dy := by - ay;
-    segLen := Sqrt(dx*dx + dy*dy);
-    if segLen <= 1e-6 then Continue;
-
-    // znormalizowany kierunek
-    ux := dx / segLen; uy := dy / segLen;
-
-    leftInSeg := segLen;
-    startX := ax; startY := ay;
-
-    while leftInSeg > 1e-6 do
-    begin
-      stepLen := patLeft;
-      if stepLen > leftInSeg then stepLen := leftInSeg;
-
-      // koniec aktualnego odcinka wzorca
-      segPts[0].x := startX;
-      segPts[0].y := startY;
-      segPts[1].x := startX + ux * stepLen;
-      segPts[1].y := startY + uy * stepLen;
-
-      if drawPhase then
-        // kreskujemy: rysujemy krótki odcinek
-        DrawPolyline(segPts, color, thickness, False);
-
-      // przechodzimy dalej
-      startX := segPts[1].x;
-      startY := segPts[1].y;
-      leftInSeg := leftInSeg - stepLen;
-
-      // zużyliśmy fragment bieżącej fazy wzorca
-      patLeft := patLeft - stepLen;
-      if patLeft <= 1e-6 then
-      begin
-        // zmiana fazy: kreska <-> przerwa
-        drawPhase := not drawPhase;
-        if drawPhase then patLeft := dashLen else patLeft := gapLen;
-      end;
-    end;
-  end;
-end;
 
 // ===== Serce przerywane =====
 
@@ -2755,7 +2938,7 @@ begin
   end;
 
   // rysujemy przerywany obrys
-  DrawDashedPolyline(pts, color, thickness, dashLen, gapLen, True);
+  DrawDashedPolyline(pts, color, thickness, dashLen, gapLen);
 end;
 
 procedure DrawDashedHeart(cx, cy: Double; width, height: Double; rotationDeg: Double;
@@ -2805,6 +2988,20 @@ begin
     DrawPolyline(pts, color, thickness, True);
 end;
 
+procedure EnsureTextFillCanvas(w, h: Integer);
+begin
+  if gTextFillCanvas = nil then
+  begin
+    gTextFillCanvas := TJSHTMLCanvasElement(document.createElement('canvas'));
+    gTextFillCtx := TJSCanvasRenderingContext2D(
+      gTextFillCanvas.getContext('2d')
+    );
+  end;
+
+  // ustaw rozmiar pod aktualny tekst
+  gTextFillCanvas.width := w;
+  gTextFillCanvas.height := h;
+end;
 
 procedure DrawHeart(cx, cy: Double; width, height: Double; rotationDeg: Double;
   const color: TColor; filled: Boolean; thickness: Integer; samples: Integer);
@@ -3064,6 +3261,129 @@ begin
   BeginSpriteBatch;
   try body(); finally EndSpriteBatch; end;
 end;
+// ==========================================
+//   SPRITE ANIMATOR – IMPLEMENTACJA BEZ POINTERÓW
+// ==========================================
+
+// ==========================================
+//   SPRITE ANIMATOR – IMPLEMENTACJA BEZ POINTERÓW I SizeOf
+// ==========================================
+
+procedure SpriteAnimInit(var SA: TSpriteAnimator; const tex: TTexture);
+begin
+  // wyzeruj rekord „ręcznie”
+  SA.sheet          := nil;
+  SA.animator       := nil;
+  SetLength(SA.clips, 0);
+  SA.currentClipIdx := -1;
+  SA.nextFrameId    := 0;
+
+  // utwórz sheet + animator
+  SA.sheet := TSpriteSheet.Create;
+  SA.sheet.texture := tex;
+
+  SA.animator := TAnimator.Create(SA.sheet);
+end;
+
+procedure SpriteAnimAddStrip(var SA: TSpriteAnimator; var spr: TSprite;
+  const clipName: String; frameCount, framesPerRow: Integer; fps: Double;
+  loop: Boolean; startFrameIndex: Integer);
+var
+  clip    : TSpriteAnimClip;
+  frameW,
+  frameH  : Integer;
+  i, idx  : Integer;
+  frameId : Integer;
+  col, row: Integer;
+  x, y    : Double;
+  r       : TRectangle;
+  fname   : String;
+begin
+  if (SA.sheet = nil) or (SA.sheet.texture.width = 0) or (frameCount <= 0)
+     or (framesPerRow <= 0) or (fps <= 0) then Exit;
+
+   frameW := SA.sheet.texture.width div framesPerRow;
+  frameH := SA.sheet.texture.height;
+
+  // origin sprite'a na środku klatki – RELATYWNIE (0..1)
+  spr.origin := NewVector(0.5, 0.5);
+
+
+  clip.name := clipName;
+  clip.loop := loop;
+  SetLength(clip.frameNames, frameCount);
+
+  for i := 0 to frameCount - 1 do
+  begin
+    idx := startFrameIndex + i;
+
+    col := idx mod framesPerRow;
+    row := idx div framesPerRow;
+
+    x := col * frameW;
+    y := row * frameH;
+
+    r := RectangleCreate(x, y, frameW, frameH);
+
+    frameId := SA.nextFrameId;
+    Inc(SA.nextFrameId);
+
+    fname := clipName + '_' + IntToStr(frameId);
+    clip.frameNames[i] := fname;
+
+    // jedna klatka trwa 1/fps sekundy
+    SA.sheet.AddFrame(fname, r, 1.0 / fps);
+  end;
+
+  // dopisz clip do tablicy
+  idx := Length(SA.clips);
+  SetLength(SA.clips, idx + 1);
+  SA.clips[idx] := clip;
+end;
+
+procedure SpriteAnimPlay(var SA: TSpriteAnimator; const clipName: String);
+var
+  i: Integer;
+begin
+  if SA.animator = nil then Exit;
+
+  for i := 0 to High(SA.clips) do
+    if SA.clips[i].name = clipName then
+    begin
+      SA.animator.SetClip(SA.clips[i].frameNames, SA.clips[i].loop);
+      SA.currentClipIdx := i;
+      Exit;
+    end;
+end;
+
+procedure SpriteAnimStop(var SA: TSpriteAnimator);
+begin
+  SA.currentClipIdx := -1;
+end;
+
+procedure SpriteAnimUpdate(var SA: TSpriteAnimator; var spr: TSprite; const dt: Double);
+begin
+  if (SA.animator = nil) then Exit;
+  if SA.currentClipIdx < 0 then Exit;
+
+  SA.animator.Update(dt);
+  SA.animator.ApplyTo(spr);
+end;
+
+procedure SpriteAnimFree(var SA: TSpriteAnimator);
+begin
+  if SA.animator <> nil then
+    SA.animator.Free;
+  if SA.sheet <> nil then
+    SA.sheet.Free;
+
+  SA.animator := nil;
+  SA.sheet    := nil;
+  SetLength(SA.clips, 0);
+  SA.currentClipIdx := -1;
+  SA.nextFrameId    := 0;
+end;
+
 function WilgaSupportsOffscreen(const Canvas: TJSHTMLCanvasElement): Boolean;
 var
   v: JSValue;
