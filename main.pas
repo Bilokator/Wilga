@@ -6,13 +6,12 @@ program JuliaFractalBufferDemo;
 uses
   SysUtils, Math,
   wilga,
-  wilga_extras,      // dla ColorFromHSV itp.
-  wilga_imagebuffer; // nasz bufor pikseli
+  wilga_imagebuffer; 
 
 const
   JULIA_COLS = 500;
   JULIA_ROWS = 400;
-  JULIA_MAX_ITER = 45;
+  JULIA_MAX_ITER = 25;
 
   RE_MIN = -1.6;
   RE_MAX =  1.6;
@@ -59,7 +58,7 @@ begin
 
     h  := v;             
     s  := 1.0;
-    vv := Power(v, 0.5); // trochę mocniejsza jasność w cieniach
+    vv := Power(v, 0.5); 
 
     Palette[i] := ColorFromHSV(h, s, vv, 255);
   end;
@@ -134,10 +133,9 @@ begin
   dx := (sw - JULIA_COLS) div 2;
   dy := (sh - JULIA_ROWS) div 2;
 
-  // jedna komenda putImageData w ramach frame:
   JuliaBuf.Draw(dx, dy);
 
-  //DrawFPS(10, 10, COLOR_WHITE);
+  DrawFPS(10, 10, COLOR_WHITE);
   DrawText('Julia (Wilga + ImageBuffer)', 10, 30, 16, COLOR_WHITE);
 end;
 
