@@ -46,6 +46,8 @@ wilga_extras.pas – funkcje dodatkowe
 
 wilga_config.inc – konfiguracja
 
+wilga-render-worker.js
+
 wilga_*.pas – pozostałe moduły Wilgi.
 
 Wszystkie pliki razem tworzą jedną bibliotekę i nie wymagają instalacji.
