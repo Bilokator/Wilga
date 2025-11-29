@@ -77,7 +77,7 @@ Pozwala to uruchomić Wilgę jednym kliknięciem.
 
 PROJEKT POWSTAŁ WE WSPÓŁPRACY Z AI.
 # Autor
-Projekt Wilga rozwijany jest przez Łukasz Mucha (Bilokator).
+Projekt Wilga rozwijany jest przez Łukasza Muchę (Bilokator).
 
 # POZDRAWIAM I DO(KODZENIA)! 👋😄
 
