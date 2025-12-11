@@ -1,6 +1,7 @@
 unit wilga_tint_cache;
 {$mode objfpc}
 {$modeswitch advancedrecords}
+{$DEFINE WILGA_TINT_DEBUG}
 
 interface
 

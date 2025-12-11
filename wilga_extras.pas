@@ -24,7 +24,8 @@ uses JS, Web, SysUtils, Math, wilga;
 
 var
   gNextCanvasId: Integer = 0;
-
+  gCrossFadeSeq: Cardinal = 0;     // licznik sekwencji crossfadu
+  gSpriteBatchDepth: Integer = 0;  // ★ nowy licznik zagnieżdżeń
 
 const 
  DEG2RAD = Pi / 180.0;
@@ -32,7 +33,7 @@ const
 
  var
   gCrossFading :boolean= False;
-  gCrossFadeSeq: Cardinal = 0;     // licznik sekwencji crossfadu
+
 { ==== Perlin Noise (2D/3D + FBM) =========================================== }
 type
   {$ifdef PAS2JS}
@@ -2184,18 +2185,40 @@ begin
   desired := target;
   k := Clamp(stiffness * dt, 0, 1);
   cam.target := Vector2Lerp(cam.target, desired, k);
-end;
 
+ 
+  cam.target.x := Round(cam.target.x);
+  cam.target.y := Round(cam.target.y);
+end;
 
 procedure CameraClampToWorld(var cam: TCamera2D; worldRect: TRectangle; viewportW, viewportH: Integer);
 var
   halfW, halfH: Double;
+  viewW, viewH: Double;
 begin
-  halfW := (viewportW / cam.zoom) * 0.5;
-  halfH := (viewportH / cam.zoom) * 0.5;
-  cam.target.x := Clamp(cam.target.x, worldRect.x + halfW, worldRect.x + worldRect.width - halfW);
+  // wielkość widoku w jednostkach świata
+  viewW := viewportW / cam.zoom;
+  viewH := viewportH / cam.zoom;
+
+  // --- BEZPIECZNIK ---
+  // jeżeli ekran pokazuje więcej świata niż mapa ma rozmiaru
+  // to clampowanie nie ma sensu -> kamera powinna być wycentrowana
+  if (viewW >= worldRect.width) or (viewH >= worldRect.height) then
+  begin
+    cam.target.x := worldRect.x + worldRect.width  * 0.5;
+    cam.target.y := worldRect.y + worldRect.height * 0.5;
+    Exit;
+  end;
+  // --- KONIEC BEZPIECZNIKA ---
+
+  // standardowy clamp
+  halfW := viewW * 0.5;
+  halfH := viewH * 0.5;
+
+  cam.target.x := Clamp(cam.target.x, worldRect.x + halfW, worldRect.x + worldRect.width  - halfW);
   cam.target.y := Clamp(cam.target.y, worldRect.y + halfH, worldRect.y + worldRect.height - halfH);
 end;
+
 procedure ClampCameraToRect(var cam: TCamera2D; viewportW, viewportH: Integer; worldW, worldH: Double);
 var
   worldRect: TRectangle;
@@ -3258,9 +3281,23 @@ begin
 end;
 procedure UsingSpriteBatch(const body: TProc);
 begin
-  BeginSpriteBatch;
-  try body(); finally EndSpriteBatch; end;
+  Inc(gSpriteBatchDepth);
+  try
+    // jeśli to pierwsze (zewnętrzne) wejście -> faktyczny BeginSpriteBatch
+    if gSpriteBatchDepth = 1 then
+      BeginSpriteBatch;
+
+    body();
+
+  finally
+    // jeśli wychodzimy z zewnętrznego poziomu -> faktyczny EndSpriteBatch
+    if gSpriteBatchDepth = 1 then
+      EndSpriteBatch;
+
+    Dec(gSpriteBatchDepth);
+  end;
 end;
+
 // ==========================================
 //   SPRITE ANIMATOR – IMPLEMENTACJA BEZ POINTERÓW
 // ==========================================
@@ -3302,12 +3339,21 @@ begin
   if (SA.sheet = nil) or (SA.sheet.texture.width = 0) or (frameCount <= 0)
      or (framesPerRow <= 0) or (fps <= 0) then Exit;
 
-   frameW := SA.sheet.texture.width div framesPerRow;
+  // --- WYMIARY KLATKI ---------------------------------------------
+  // domyślnie: strip 1xN (jak ogień)
+  frameW := SA.sheet.texture.width div framesPerRow;
   frameH := SA.sheet.texture.height;
+
+  // jeśli sprite ma ustawione src.width/height INNE niż cały arkusz,
+  // traktujemy je jako rozmiar pojedynczej klatki (np. 4x5 sheet).
+  if (spr.src.width > 0) and (Round(spr.src.width) <> SA.sheet.texture.width) then
+    frameW := Round(spr.src.width);
+  if (spr.src.height > 0) and (Round(spr.src.height) <> SA.sheet.texture.height) then
+    frameH := Round(spr.src.height);
+  // ---------------------------------------------------------------
 
   // origin sprite'a na środku klatki – RELATYWNIE (0..1)
   spr.origin := NewVector(0.5, 0.5);
-
 
   clip.name := clipName;
   clip.loop := loop;
@@ -3340,6 +3386,7 @@ begin
   SetLength(SA.clips, idx + 1);
   SA.clips[idx] := clip;
 end;
+
 
 procedure SpriteAnimPlay(var SA: TSpriteAnimator; const clipName: String);
 var

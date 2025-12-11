@@ -160,26 +160,40 @@ function applyCommand(cmd) {
       ctx.drawImage.apply(ctx, [tex].concat(a));
       break;
     // ===== bufor pikseli (ImageData w ramach frame) =====
-    case 'putImageData':
-      if (!ctx) break;
-      if (!cmd.buffer ||
-          typeof cmd.width  !== 'number' ||
-          typeof cmd.height !== 'number') {
-        break;
-      }
-      try {
-        var imgData = new ImageData(cmd.buffer, cmd.width, cmd.height);
-        ctx.putImageData(imgData, cmd.x || 0, cmd.y || 0);
-      } catch (e) {
-        try {
-          var buf = new Uint8ClampedArray(cmd.buffer);
-          var imgData2 = new ImageData(buf, cmd.width, cmd.height);
-          ctx.putImageData(imgData2, cmd.x || 0, cmd.y || 0);
-        } catch (e2) {
-          // ignore
-        }
-      }
-      break;
+ case 'putImageData':
+  if (!ctx) break;
+  if (!cmd.buffer ||
+      typeof cmd.width  !== 'number' ||
+      typeof cmd.height !== 'number') {
+    break;
+  }
+
+  try {
+    var buf = cmd.buffer;
+    if (!(buf instanceof Uint8ClampedArray)) {
+      buf = new Uint8ClampedArray(buf);
+    }
+
+    var imgData = new ImageData(buf, cmd.width, cmd.height);
+
+    // jeśli mamy OffscreenCanvas – zrób z ImageData teksturę i narysuj ją drawImage
+    if (typeof OffscreenCanvas === 'function') {
+      var tmp = new OffscreenCanvas(cmd.width, cmd.height);
+      var tctx = tmp.getContext('2d');
+      tctx.putImageData(imgData, 0, 0);
+
+      // I TERAZ: drawImage — tutaj działa alpha-blending
+      ctx.drawImage(tmp, cmd.x || 0, cmd.y || 0);
+    } else {
+      // fallback – jak wcześniej, bez blendu
+      ctx.putImageData(imgData, cmd.x || 0, cmd.y || 0);
+    }
+  } catch (e) {
+    // można zostawić prosty fallback albo zignorować
+  }
+
+  break;
+
 
     // ===== zwykłe metody =====
     case 'call':
@@ -227,7 +241,12 @@ self.onmessage = function (e) {
     case 'registerTexture':
       textures[data.id] = data.bitmap;
       break;
-
+      
+    case 'unregisterTexture':
+      if (textures[data.id]) {
+        delete textures[data.id];
+      }
+      break;
 
     // ===== WŁĄCZANIE / KONFIGURACJA PIXEL-ARTU Z ZEWNĄTRZ =====
     //
@@ -258,12 +277,16 @@ self.onmessage = function (e) {
       var cmds = data.cmds || [];
 
       // tryb normalny — bez pixel-artu, pełna zgodność wstecz
-      if (!pixelArtEnabled) {
-        for (var i = 0; i < cmds.length; i++) {
-          applyCommand(cmds[i]);
-        }
-        break;
-      }
+     if (!pixelArtEnabled) {
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);  // ★★★ NAPRAWA DUCHÓW ★★★
+
+    for (var i = 0; i < cmds.length; i++) {
+        applyCommand(cmds[i]);
+    }
+    break;
+}
+
 
       // tryb pixel-art
       ensureFullCanvas();

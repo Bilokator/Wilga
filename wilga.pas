@@ -16,19 +16,46 @@ unit wilga;
 interface
 
 uses
-  JS, Web, SysUtils,wilga_shadowstate,
+  JS, Web, SysUtils,wilga_shadowstate,WebAudio,
  Math
   {$IFDEF WILGA_TEXT_CACHE}
   , wilga_text_cache
   {$ENDIF}
   ;
-type
+  type
+TSoundInstance = class
+  public
+    source : TJSAudioBufferSourceNode;
+    gain   : TJSGainNode;
+    panner : TJSStereoPannerNode; // NOWE: panorama L/R
+    looped : Boolean;
+    playing: Boolean;
+    procedure Stop;
+  end;
+
+
+  // "Pool" oparty na Web Audio – trzymamy tylko zdekodowany bufor,
+  // domyślną głośność, flagę loop oraz ewentualną aktywną pętlę
+  TSoundPool = record
+    url          : String;
+    buffer       : TJSAudioBuffer;
+    defaultVolume: Double;
+    looped       : Boolean;
+    valid        : Boolean;
+    activeLoop   : TSoundInstance;  // dla dźwięków loopowanych (np. muzyka)
+  end;
+
+
   TTimeMS = NativeUInt; 
  var
   gCtx: TJSCanvasRenderingContext2D;
 
 
 
+
+
+var
+  gCharQueue: TJSArray; // globalnie, obok gKeys/gKeysPressed
 
   gMeasureCanvas: TJSHTMLCanvasElement = nil;
   gMeasureCtx   : TJSCanvasRenderingContext2D = nil; 
@@ -45,6 +72,8 @@ type
   GTextWidthCache: TJSMap = nil;
   GTextHeightCache: TJSMap = nil;
   GNextTextureId: Integer = 1;
+
+
 
 type
 
@@ -67,26 +96,31 @@ TNoArgProc = procedure;
 
   TSoundHandle = Integer;
 
+type
+  TSoundPoolItem = record
+    el: TJSHTMLAudioElement;
+  end;
+
 
   type
     TMouseBtn = 0..2; // 0=LPM, 1=ŚPM, 2=PPM
     const
-  W_PRESSED_HOLD_MS = 100;
-  W_KEY_PRESSED_HOLD_MS = 120; // keep key 'Pressed' edge latched for at least this many ms
+  W_PRESSED_HOLD_MS = 90;
+  W_KEY_PRESSED_HOLD_MS = 90; // keep key 'Pressed' edge latched for at least this many ms
   // ile ms krawędź "Pressed" ma być widoczna co najmniej
 var
   // zbocza na klatkę
-  W_Pressed:  array[TMouseBtn] of Boolean;   // DOWN na tej klatce
-  W_Released: array[TMouseBtn] of Boolean;   // UP   na tej klatce
+  W_Pressed:  array[TMouseBtn] of Boolean;   
+  W_Released: array[TMouseBtn] of Boolean;   
 
 
 
 
-  W_PressedNext   : array[0..2] of Boolean;  // masz już – zostaw
-  W_ReleasedNext  : array[0..2] of Boolean;  // masz już – zostaw
+  W_PressedNext   : array[0..2] of Boolean;  
+  W_ReleasedNext  : array[0..2] of Boolean;  
  
-
-  W_CurrDown      : array[0..2] of Boolean;  // masz już – zostaw
+    
+  W_CurrDown      : array[0..2] of Boolean;  
 
   // NOWE: „rozciągnięcie” krawędzi Pressed w czasie
   W_PressedUntilMS: array[0..2] of TTimeMS;
@@ -233,6 +267,9 @@ endColor: TColor;
   var
   gCurrentBlendMode: TBlendMode = bmNormal;
 { ====== FUNKCJE POMOCNICZE ====== }
+procedure StartSource(src: TJSAudioBufferSourceNode; when: Double);
+procedure ResumeAudioIfNeeded;
+procedure initaudio;
 function GetScreenWidth: Integer;
 function GetScreenHeight: Integer;
 function GetMouseX: Integer;
@@ -486,11 +523,14 @@ procedure UnloadSoundEx(handle: TSoundHandle);
 procedure PlaySoundEx(handle: TSoundHandle); overload;
 procedure PlaySoundEx(handle: TSoundHandle; volume: Double); overload;
 procedure StopSoundEx(handle: TSoundHandle);
+procedure PlaySoundEx(handle: TSoundHandle; volume, pitch, pan: Double); overload;
 procedure SetSoundVolume(handle: TSoundHandle; volume: Double);
 procedure SetSoundLoop(handle: TSoundHandle; looped: Boolean);
 function PlaySound(const url: String): Boolean;
 function PlaySoundLoop(const url: String): Boolean;
 procedure StopAllSounds;
+function IsSoundFinished(handle: TSoundHandle): Boolean;
+
 
 { ====== FABRYKI ====== }
 function NewVector(ax, ay: Double): TInputVector;
@@ -1042,12 +1082,186 @@ procedure PolyScaleInPlace(var poly: array of TInputVector; const s: Double);
 procedure PolyRotateInPlace(var poly: array of TInputVector; angleRad: Double);
 
 implementation
+
+var
+  GMousePrevPressed: array[0..2] of Boolean;
+  GMousePrevReleased: array[0..2] of Boolean;
+
+  gAudioCtx    : TJSAudioContext = nil;
+  gMasterGain  : TJSGainNode     = nil;
+  gActiveSounds: array of TSoundInstance;
+  gSoundPools  : array of TSoundPool;
+// NOWA WERSJA – z pitch i pan
+function CreateInstanceFromBuffer(const buf: TJSAudioBuffer;
+  volume, pitch, pan: Double; looped: Boolean): TSoundInstance; overload;
+var
+  src    : TJSAudioBufferSourceNode;
+  gain   : TJSGainNode;
+  panNode: TJSStereoPannerNode;
+  inst   : TSoundInstance;
+begin
+  InitAudio;
+  ResumeAudioIfNeeded;
+
+  // volume [0..1]
+  if volume < 0 then volume := 0
+  else if volume > 1 then volume := 1;
+
+  // pitch > 0 (1.0 = normalnie)
+  if pitch <= 0 then pitch := 1.0;
+
+  // pan [-1..1] (−1 = pełne lewo, 0 = środek, 1 = prawo)
+  if pan < -1.0 then pan := -1.0
+  else if pan > 1.0 then pan := 1.0;
+
+  src := gAudioCtx.createBufferSource;
+  src.buffer := buf;
+  src.loop   := looped;
+  src.playbackRate.value := pitch;
+
+  gain := gAudioCtx.createGain;
+  gain.gain.value := volume;
+
+  panNode := nil;
+  try
+    panNode := TJSStereoPannerNode(gAudioCtx.createStereoPanner);
+  except
+    panNode := nil; // przeglądarka nie wspiera → gramy bez panoramy
+  end;
+
+  if panNode <> nil then
+  begin
+    panNode.pan.value := pan;
+    src.connect(panNode);
+    panNode.connect(gain);
+  end
+  else
+  begin
+    src.connect(gain);
+  end;
+
+  gain.connect(gMasterGain);
+
+  inst := TSoundInstance.Create;
+  inst.source  := src;
+  inst.gain    := gain;
+  inst.panner  := panNode;
+  inst.looped  := looped;
+  inst.playing := True;
+
+  asm
+    src.onended = function(e) {
+      inst.playing = false;
+    };
+  end;
+
+  {$ifdef WILGA_DEBUG} DBG_Inc(dbg_AudioElemsAlive); {$endif}
+  SetLength(gActiveSounds, Length(gActiveSounds)+1);
+  gActiveSounds[High(gActiveSounds)] := inst;
+
+  StartSource(src, 0);
+
+  Result := inst;
+end;
+
+// STARA SYGNATURA – zachowana dla kompatybilności
+function CreateInstanceFromBuffer(const buf: TJSAudioBuffer;
+  volume: Double; looped: Boolean): TSoundInstance; overload;
+begin
+  // domyślnie: normalny pitch, środek panoramy
+  Result := CreateInstanceFromBuffer(buf, volume, 1.0, 0.0, looped);
+end;
+
+function IsSoundFinished(handle: TSoundHandle): Boolean;
+var
+  p  : ^TSoundPool;
+  i  : Integer;
+  buf: TJSAudioBuffer;
+begin
+  // Jeśli handle jest spoza zakresu — traktujemy jako "skończony"
+  if (handle < 0) or (handle > High(gSoundPools)) then
+    Exit(True);
+
+  p := @gSoundPools[handle];
+
+  // Jeśli jeszcze niezaładowany albo brak bufora – też uznajemy za skończony
+  if (not p^.valid) or (p^.buffer = nil) then
+    Exit(True);
+
+  // Jeśli dźwięk jest loopowany (np. muzyka):
+  // patrzymy na aktywną pętlę
+  if p^.looped then
+  begin
+    if (p^.activeLoop <> nil) and p^.activeLoop.playing then
+      Exit(False) // wciąż gra
+    else
+      Exit(True); // nie ma aktywnej pętli albo nie gra
+  end;
+
+  // Dla zwykłych jednorazowych efektów:
+  // szukamy w gActiveSounds instancji, która używa tego samego buffer
+  buf := p^.buffer;
+
+  for i := 0 to High(gActiveSounds) do
+    if (gActiveSounds[i] <> nil) and
+       gActiveSounds[i].playing and
+       (gActiveSounds[i].source <> nil) and
+       (gActiveSounds[i].source.buffer = buf) then
+    begin
+      // Znaleźliśmy grającą instancję dla tego sounda
+      Exit(False);
+    end;
+
+  // Nie znaleźliśmy grającej instancji → dźwięk skończony
+  Result := True;
+end;
+
+procedure StartSource(src: TJSAudioBufferSourceNode; when: Double);
+begin
+  asm src.start(when); end;
+end;
+
+procedure StopSource(src: TJSAudioBufferSourceNode; when: Double);
+begin
+  asm src.stop(when); end;
+end;
+procedure TSoundInstance.Stop;
+begin
+  if (source <> nil) and playing then
+  begin
+    try
+      StopSource(source, 0);
+    except
+      // ignorujemy błędy zatrzymania
+    end;
+  end;
+  playing := False;
+end;
+
+procedure InitAudio;
+begin
+  if gAudioCtx <> nil then Exit;
+
+  gAudioCtx := TJSAudioContext.new;
+  gMasterGain := gAudioCtx.createGain;
+  gMasterGain.connect(gAudioCtx.destination);
+  gMasterGain.gain.value := 1.0;
+end;
+
+
+procedure ResumeAudioIfNeeded;
+begin
+  if (gAudioCtx <> nil) and (gAudioCtx.state = 'suspended') then
+    gAudioCtx.resume();
+end;
+
 const
   W_WATCHDOG_TIMEOUT_MS = 60000; // 2.5 sekundy – możesz zwiększyć jeśli chcesz
 {$IFDEF WILGA_LEAK_GUARD}
 
 
 var
+
   GSaveDepth: Integer = 0;
   GFrameDepth  : Integer = 0; // prywatny poziom ramki
 {$ENDIF}
@@ -1058,6 +1272,7 @@ var
   W_DownTimeMS     : array[0..2] of TTimeMS;
   W_InputInited: Boolean = False;
   W_ListenersAttached: Boolean = False;
+
 
 
 
@@ -1143,7 +1358,6 @@ var
     begin
       W_CurrDown[b]     := False;
       W_ReleasedNext[b] := True;   // krawędź Released
-      // UWAGA: NIE kasujemy tu W_PressedUntilMS[b] — zostawiamy HOLD do końca okna
       Inc(W_DBG_WilgaUp);
     end;
   end;
@@ -1265,6 +1479,41 @@ begin
     if (window.__wilgaSubmitFrame) window.__wilgaSubmitFrame();
   end;
 end;
+
+procedure W_InternalRegisterCanvasAsTexture(const cnv: TJSHTMLCanvasElement);
+begin
+  asm
+    (function(c) {
+      var worker = window.__wilgaRenderWorker;
+      if (!c || typeof createImageBitmap !== "function") return;
+
+      // ★★★ SPRITE ID SEPARATED ★★★
+      if (!window.__wilgaSpriteNextTexId)
+        window.__wilgaSpriteNextTexId = 1;
+
+      if (!c.__wilgaTexId)
+        c.__wilgaTexId = window.__wilgaSpriteNextTexId++;
+
+      var id = c.__wilgaTexId;
+
+      console.log("[main] __RegisterCanvasAsTexture (SPRITE) id=", id, c);
+
+      if (worker) {
+        createImageBitmap(c).then(function(bmp) {
+          worker.postMessage(
+            { type: "registerTexture", id: id, bitmap: bmp },
+            [bmp]
+          );
+        });
+      } else {
+        if (!window.__wilgaPendingTextures) window.__wilgaPendingTextures = [];
+        window.__wilgaPendingTextures.push(c);
+      }
+    })(cnv);
+  end;
+end;
+
+
 procedure W_RegisterHelperCanvas(const cnv: TJSHTMLCanvasElement);
 begin
   if cnv = nil then
@@ -1275,31 +1524,7 @@ begin
 
   writeln('W_RegisterHelperCanvas: canvas size = ', cnv.width, 'x', cnv.height);
 
-  asm
-    var worker = window.__wilgaRenderWorker;
-
-    if (!cnv || typeof createImageBitmap !== "function") return;
-
-    if (!cnv.__wilgaTexId) {
-      if (!window.__wilgaNextTexId) window.__wilgaNextTexId = 1;
-      cnv.__wilgaTexId = window.__wilgaNextTexId++;
-    }
-    var id = cnv.__wilgaTexId;
-
-    console.log("[main] W_RegisterHelperCanvas id=", id, cnv);
-
-    if (worker) {
-      createImageBitmap(cnv).then(function(bmp) {
-        worker.postMessage(
-          { type: "registerTexture", id: id, bitmap: bmp },
-          [bmp]
-        );
-      });
-    } else {
-      if (!window.__wilgaPendingTextures) window.__wilgaPendingTextures = [];
-      window.__wilgaPendingTextures.push(cnv);
-    }
-  end;
+  W_InternalRegisterCanvasAsTexture(cnv);
 end;
 
 
@@ -1316,34 +1541,17 @@ begin
 
   writeln('W_RegisterTexture: tex=', Tex.width, 'x', Tex.height);
 
-  jsCanvas := Tex.canvas;
+   jsCanvas := Tex.canvas;
 
+  // wspólna logika rejestrująca canvas jako teksturę
+  W_InternalRegisterCanvasAsTexture(jsCanvas);
+
+  // po wywołaniu helpera mamy __wilgaTexId na canvasie – zapisz go w rekordzie
   asm
-    var worker = window.__wilgaRenderWorker;
-
-    if (!jsCanvas || typeof createImageBitmap !== "function") return;
-
-    if (!jsCanvas.__wilgaTexId) {
-      if (!window.__wilgaNextTexId) window.__wilgaNextTexId = 1;
-      jsCanvas.__wilgaTexId = window.__wilgaNextTexId++;
-    }
-    var id = jsCanvas.__wilgaTexId;
-
-    console.log("[main] W_RegisterTexture id=", id, jsCanvas);
-
-    if (worker) {
-      createImageBitmap(jsCanvas).then(function(bmp) {
-        worker.postMessage(
-          { type: "registerTexture", id: id, bitmap: bmp },
-          [bmp]
-        );
-      });
-    } else {
-      if (!window.__wilgaPendingTextures) window.__wilgaPendingTextures = [];
-      window.__wilgaPendingTextures.push(jsCanvas);
-    }
+    Tex.texId = jsCanvas.__wilgaTexId || 0;
   end;
 end;
+
 
 
 procedure WilgaAddPutImageDataCommand(x, y, width, height: Integer; const Buf: TJSUint8ClampedArray);
@@ -1379,6 +1587,7 @@ procedure EndCircleBatchFill;
 begin
   gCtx.fill;
 end;
+
 
 // ====== Batch obrysów okręgów ======
 procedure BeginCircleStrokeBatch(const color: TColor; thickness: Integer = 1);
@@ -1437,7 +1646,7 @@ gCamZoom:   Double  = 1.0;    // bieżący zoom kamery (dla snapowania obiektów
   gKeys: TJSObject;
   gKeysPressed: TJSObject;
   gKeyPressedUntil: TJSObject; // DEBUG anti-miss hold window for key edges
-
+  gKeyLastDown: TJSObject;    
   gKeysReleased: TJSObject;// Zamiast: array of String
 
   gMouseButtonsDown: array[0..2] of Boolean;
@@ -1479,7 +1688,9 @@ gCamZoom:   Double  = 1.0;    // bieżący zoom kamery (dla snapowania obiektów
   gProfileData: TJSObject;
 
   // Sound
-  gActiveSounds: array of TJSHTMLAudioElement;
+   // Sound
+
+
 
   // Particle systems
   gParticleSystems: array of TParticleSystem;
@@ -2100,7 +2311,7 @@ end;
 
 procedure EndRectSeries;
 begin
-  // nic – zostawiamy fillStyle
+
 end;
 
 function GetScreenWidth: Integer;
@@ -2971,10 +3182,26 @@ procedure ReleaseTexture(var tex: TTexture);
 begin
   if tex.canvas <> nil then
   begin
-    // bezpiecznie czyścimy rozmiar (obsługuje też OffscreenCanvas)
+    // --------------------------
+    // 1) UNREGISTER z WORKERA
+    // --------------------------
+    asm
+      var worker = window.__wilgaRenderWorker;
+      if (worker && tex.canvas && tex.canvas.__wilgaTexId)
+      {
+        worker.postMessage(
+          { type: 'unregisterTexture', id: tex.canvas.__wilgaTexId }
+        );
+      }
+    end;
+
+    // --------------------------
+    // 2) Skasowanie fizycznej bitmapy canvasu
+    // --------------------------
     asm
       var cnv = tex.canvas;
-      var off = cnv && cnv.__wilgaOffscreen ? cnv.__wilgaOffscreen : null;
+      var off = (cnv && cnv.__wilgaOffscreen) ? cnv.__wilgaOffscreen : null;
+
       if (off) {
         off.width = 0;
         off.height = 0;
@@ -2984,9 +3211,15 @@ begin
       }
     end;
 
-    // zerujemy referencję – pozwala GC to zwolnić
+    // --------------------------
+    // 3) Zwolnienie referencji
+    // --------------------------
     tex.canvas := nil;
-    {$ifdef WILGA_DEBUG} DBG_Dec(dbg_TexturesAlive); {$endif}
+
+    // Debug - zachowane bez zmian
+    {$ifdef WILGA_DEBUG}
+      DBG_Dec(dbg_TexturesAlive);
+    {$endif}
   end;
 
   tex.loaded := False;
@@ -3804,216 +4037,363 @@ begin
   else
     Result := target;
 end;
+function PlayBuffer(const buf: TJSAudioBuffer; looped: Boolean): TSoundInstance;
+var
+  src : TJSAudioBufferSourceNode;
+  gain: TJSGainNode;
+  inst: TSoundInstance;
+begin
+  InitAudio;
+  ResumeAudioIfNeeded;
+
+  src := gAudioCtx.createBufferSource;
+  src.buffer := buf;
+  src.loop := looped;
+
+  gain := gAudioCtx.createGain;
+  gain.gain.value := 1.0; // na razie bez regulacji głośności per dźwięk
+
+  src.connect(gain);
+  gain.connect(gMasterGain);
+
+  inst := TSoundInstance.Create;
+  inst.source := src;
+  inst.gain   := gain;
+  inst.looped := looped;
+  inst.playing := True;
+
+  {$ifdef WILGA_DEBUG} DBG_Inc(dbg_AudioElemsAlive); {$endif}
+  SetLength(gActiveSounds, Length(gActiveSounds)+1);
+  gActiveSounds[High(gActiveSounds)] := inst;
+
+  StartSource(src, 0);
+
+
+  Result := inst;
+end;
+
+
 
 { ====== DŹWIĘK ====== }
 function PlaySound(const url: String): Boolean;
 var
-  audio: TJSHTMLAudioElement;
+  onResponse    : reference to function (v: JSValue): JSValue;
+  onArrayBuffer : reference to function (v: JSValue): JSValue;
+  onDecoded     : reference to function (v: JSValue): JSValue;
 begin
-  Result := False;
-  audio := TJSHTMLAudioElement(document.createElement('audio'));
-  {$ifdef WILGA_DEBUG} DBG_Inc(dbg_AudioElemsAlive); {$endif}
-  audio.src := url;
-  try
-    audio.play();
-    SetLength(gActiveSounds, Length(gActiveSounds) + 1);
-    gActiveSounds[High(gActiveSounds)] := audio;
-    Result := True;
-  except
-    Result := False;
-  end;
+  InitAudio;
+  ResumeAudioIfNeeded;
+  Result := True; // samo zainicjowanie łańcucha jest OK
+
+  // 3) Po zdekodowaniu AudioBuffer -> odtwarzamy jednorazowo
+  onDecoded :=
+    function (v: JSValue): JSValue
+    var
+      buf: TJSAudioBuffer;
+    begin
+      buf := TJSAudioBuffer(v);
+      PlayBuffer(buf, False);
+      Result := nil; // wynik tej funkcji (JS Promise callback)
+    end;
+
+  // 2) Po otrzymaniu ArrayBuffer -> decodeAudioData
+  onArrayBuffer :=
+    function (v: JSValue): JSValue
+    var
+      ab: TJSArrayBuffer;
+    begin
+      ab := TJSArrayBuffer(v);
+      gAudioCtx.decodeAudioData(ab)._then(onDecoded);
+      Result := nil;
+    end;
+
+  // 1) Po fetch(url) -> bierzemy Response i wołamy arrayBuffer()
+  onResponse :=
+    function (v: JSValue): JSValue
+    var
+      res: TJSResponse;
+    begin
+      res := TJSResponse(v);
+      res.arrayBuffer()._then(onArrayBuffer);
+      Result := nil;
+    end;
+
+  window.fetch(url)._then(onResponse);
 end;
+
 
 function PlaySoundLoop(const url: String): Boolean;
 var
-  audio: TJSHTMLAudioElement;
+  onResponse    : reference to function (v: JSValue): JSValue;
+  onArrayBuffer : reference to function (v: JSValue): JSValue;
+  onDecoded     : reference to function (v: JSValue): JSValue;
 begin
-  Result := False;
-  audio := TJSHTMLAudioElement(document.createElement('audio'));
-  {$ifdef WILGA_DEBUG} DBG_Inc(dbg_AudioElemsAlive); {$endif}
-  audio.src := url;
-  audio.loop := True;
-  try
-    audio.play();
-    SetLength(gActiveSounds, Length(gActiveSounds) + 1);
-    gActiveSounds[High(gActiveSounds)] := audio;
-    Result := True;
-  except
-    Result := False;
-  end;
+  InitAudio;
+  ResumeAudioIfNeeded;
+  Result := True;
+
+  onDecoded :=
+    function (v: JSValue): JSValue
+    var
+      buf: TJSAudioBuffer;
+    begin
+      buf := TJSAudioBuffer(v);
+      PlayBuffer(buf, True);   // TU różnica: True = loop
+      Result := nil;
+    end;
+
+  onArrayBuffer :=
+    function (v: JSValue): JSValue
+    var
+      ab: TJSArrayBuffer;
+    begin
+      ab := TJSArrayBuffer(v);
+      gAudioCtx.decodeAudioData(ab)._then(onDecoded);
+      Result := nil;
+    end;
+
+  onResponse :=
+    function (v: JSValue): JSValue
+    var
+      res: TJSResponse;
+    begin
+      res := TJSResponse(v);
+      res.arrayBuffer()._then(onArrayBuffer);
+      Result := nil;
+    end;
+
+  window.fetch(url)._then(onResponse);
 end;
 
 procedure StopAllSounds;
 var
   i: Integer;
 begin
+  // zatrzymaj wszystkie instancje (efekty + muzyka)
   for i := 0 to High(gActiveSounds) do
-  begin
-    gActiveSounds[i].pause();
-    gActiveSounds[i].src := '';
-  end;
-  {$ifdef WILGA_DEBUG}
-  // gActiveSounds zawiera wszystkie tymczasowe audio utworzone przez PlaySound/Loop
-  while Length(gActiveSounds) > 0 do
-  begin
-    // każdy element usuwamy z licznika
-    DBG_Dec(dbg_AudioElemsAlive);
-    SetLength(gActiveSounds, Length(gActiveSounds)-1);
-  end;
-{$else}
-  SetLength(gActiveSounds, 0);
-{$endif}
+    if gActiveSounds[i] <> nil then
+    begin
+      try
+        gActiveSounds[i].Stop;
+      except
+      end;
 
+      gActiveSounds[i].Free;
+      {$ifdef WILGA_DEBUG} DBG_Dec(dbg_AudioElemsAlive); {$endif}
+      gActiveSounds[i] := nil;
+    end;
   SetLength(gActiveSounds, 0);
+
+  // wyczyść info o aktywnych pętlach w poolach
+  for i := 0 to High(gSoundPools) do
+    if gSoundPools[i].activeLoop <> nil then
+      gSoundPools[i].activeLoop := nil;
 end;
 
-type
-  TSoundPoolItem = record
-    el: TJSHTMLAudioElement;
-  end;
 
-  TSoundPool = record
-    url: String;
-    items: array of TSoundPoolItem; // pre-załadowane elementy
-    nextIdx: Integer;
-    volume: Double; // 0..1
-    looped: Boolean;
-    valid: Boolean;
-  end;
 
+function LoadSoundEx(const url: String; voices: Integer = 4;
+  volume: Double = 1.0; looped: Boolean = False): TSoundHandle;
 var
-  gSoundPools: array of TSoundPool;
-
-function  LoadSoundEx(const url: String; voices: Integer = 4; volume: Double = 1.0; looped: Boolean = False): TSoundHandle;
-var
-  i: Integer;
-  h: Integer;
-  a: TJSHTMLAudioElement;
+  h            : Integer;
+  onResponse   : reference to function (v: JSValue): JSValue;
+  onArrayBuffer: reference to function (v: JSValue): JSValue;
+  onDecoded    : reference to function (v: JSValue): JSValue;
 begin
-  if voices <= 0 then voices := 1;
-  if volume < 0 then volume := 0 else if volume > 1 then volume := 1;
+  InitAudio;
+  ResumeAudioIfNeeded;
 
-  // nowy slot
+  if volume < 0 then volume := 0
+  else if volume > 1 then volume := 1;
+
+  // nowy slot (możesz dodać reuse po url, jeśli chcesz)
   SetLength(gSoundPools, Length(gSoundPools)+1);
   h := High(gSoundPools);
-  gSoundPools[h].url := url;
-  gSoundPools[h].nextIdx := 0;
-  gSoundPools[h].volume := volume;
-  gSoundPools[h].looped := looped;
-  gSoundPools[h].valid := True;
 
-  SetLength(gSoundPools[h].items, voices);
-  for i := 0 to voices-1 do
-  begin
-    a := TJSHTMLAudioElement(document.createElement('audio'));
-    {$ifdef WILGA_DEBUG} DBG_Inc(dbg_AudioElemsAlive); {$endif}
-
-    a.src := url;
-    a.preload := 'auto';
-    a.loop := looped;
-    a.volume := volume;
-    gSoundPools[h].items[i].el := a;
-  end;
+  gSoundPools[h].url           := url;
+  gSoundPools[h].buffer        := nil;
+  gSoundPools[h].defaultVolume := volume;
+  gSoundPools[h].looped        := looped;
+  gSoundPools[h].valid         := False;
+  gSoundPools[h].activeLoop    := nil;
 
   Result := h;
+
+  // Promise 1: po decodeAudioData
+  onDecoded :=
+    function (v: JSValue): JSValue
+    var
+      buf: TJSAudioBuffer;
+    begin
+      buf := TJSAudioBuffer(v);
+      gSoundPools[h].buffer := buf;
+      gSoundPools[h].valid  := True;
+      Result := nil;
+    end;
+
+  // Promise 2: po arrayBuffer()
+  onArrayBuffer :=
+    function (v: JSValue): JSValue
+    var
+      ab: TJSArrayBuffer;
+    begin
+      ab := TJSArrayBuffer(v);
+      gAudioCtx.decodeAudioData(ab)._then(onDecoded);
+      Result := nil;
+    end;
+
+  // Promise 3: po fetch(url)
+  onResponse :=
+    function (v: JSValue): JSValue
+    var
+      res: TJSResponse;
+    begin
+      res := TJSResponse(v);
+      res.arrayBuffer()._then(onArrayBuffer);
+      Result := nil;
+    end;
+
+  window.fetch(url)._then(onResponse);
 end;
 
 procedure UnloadSoundEx(handle: TSoundHandle);
 var
-  i: Integer;
+  p: ^TSoundPool;
 begin
   if (handle < 0) or (handle > High(gSoundPools)) then Exit;
-  if not gSoundPools[handle].valid then Exit;
 
-  for i := 0 to High(gSoundPools[handle].items) do
+  p := @gSoundPools[handle];
+
+  StopSoundEx(handle);
+
+  p^.buffer := nil;
+  p^.valid  := False;
+  p^.url    := '';
+end;
+procedure PlaySoundEx(handle: TSoundHandle; volume: Double);
+var
+  p: ^TSoundPool;
+  v: Double;
+begin
+  if (handle < 0) or (handle > High(gSoundPools)) then Exit;
+
+  p := @gSoundPools[handle];
+  if (not p^.valid) or (p^.buffer = nil) then Exit;
+
+  if volume < 0 then
+    v := p^.defaultVolume
+  else
+    v := volume;
+
+  if v < 0 then v := 0 else if v > 1 then v := 1;
+
+  if p^.looped then
   begin
-    try
-      gSoundPools[handle].items[i].el.pause();
-      gSoundPools[handle].items[i].el.src := '';
-    except end;
-    {$ifdef WILGA_DEBUG} DBG_Dec(dbg_AudioElemsAlive); {$endif}
-  end;
+    // zatrzymaj poprzednią pętlę
+    if p^.activeLoop <> nil then
+    begin
+      p^.activeLoop.Stop;
+      p^.activeLoop.Free;
+      {$ifdef WILGA_DEBUG} DBG_Dec(dbg_AudioElemsAlive); {$endif}
+      p^.activeLoop := nil;
+    end;
 
-  gSoundPools[handle].valid := False;
-  SetLength(gSoundPools[handle].items, 0);
+    p^.activeLoop := CreateInstanceFromBuffer(p^.buffer, v, True);
+  end
+  else
+  begin
+    // jednorazowy efekt – nie musimy przechowywać instancji
+    CreateInstanceFromBuffer(p^.buffer, v, False);
+  end;
 end;
 
 procedure PlaySoundEx(handle: TSoundHandle);
 begin
-  PlaySoundEx(handle, -1.0); // -1 → użyj domyślnej głośności z poola
+  PlaySoundEx(handle, -1.0);
 end;
-
-procedure PlaySoundEx(handle: TSoundHandle; volume: Double);
+procedure PlaySoundEx(handle: TSoundHandle; volume, pitch, pan: Double);
 var
-  pool: ^TSoundPool;
-  a: TJSHTMLAudioElement;
+  p: ^TSoundPool;
+  v: Double;
 begin
   if (handle < 0) or (handle > High(gSoundPools)) then Exit;
-  if not gSoundPools[handle].valid then Exit;
 
-  pool := @gSoundPools[handle];
-  if Length(pool^.items) = 0 then Exit;
+  p := @gSoundPools[handle];
+  if (not p^.valid) or (p^.buffer = nil) then Exit;
 
-  a := pool^.items[pool^.nextIdx].el;
-  pool^.nextIdx := (pool^.nextIdx + 1) mod Length(pool^.items);
+  if volume < 0 then
+    v := p^.defaultVolume
+  else
+    v := volume;
 
-  // reset i parametry
-  try
-    if volume >= 0 then a.volume := volume
-                   else a.volume := pool^.volume;
-    a.loop := pool^.looped;
+  if v < 0 then v := 0 else if v > 1 then v := 1;
 
-    try a.currentTime := 0; except end;
+  // pętla (np. muzyka) – restartujemy z nowymi parametrami
+  if p^.looped then
+  begin
+    if p^.activeLoop <> nil then
+    begin
+      p^.activeLoop.Stop;
+      p^.activeLoop.Free;
+      {$ifdef WILGA_DEBUG} DBG_Dec(dbg_AudioElemsAlive); {$endif}
+      p^.activeLoop := nil;
+    end;
 
-    a.play();
-  except
-    // ignoruj (autoplay blokada)
+    p^.activeLoop := CreateInstanceFromBuffer(p^.buffer, v, pitch, pan, True);
+  end
+  else
+  begin
+    // jednorazowy efekt – po prostu odpal z tym pitch/pan
+    CreateInstanceFromBuffer(p^.buffer, v, pitch, pan, False);
   end;
 end;
 
+
+
 procedure StopSoundEx(handle: TSoundHandle);
 var
-  i: Integer;
-  a: TJSHTMLAudioElement;
+  p: ^TSoundPool;
 begin
   if (handle < 0) or (handle > High(gSoundPools)) then Exit;
-  if not gSoundPools[handle].valid then Exit;
 
-  for i := 0 to High(gSoundPools[handle].items) do
+  p := @gSoundPools[handle];
+  if p^.activeLoop <> nil then
   begin
-    a := gSoundPools[handle].items[i].el;
-    try
-      a.pause();
-      try a.currentTime := 0; except end;
-    except end;
+    p^.activeLoop.Stop;
+    p^.activeLoop.Free;
+    {$ifdef WILGA_DEBUG} DBG_Dec(dbg_AudioElemsAlive); {$endif}
+    p^.activeLoop := nil;
   end;
 end;
 
 procedure SetSoundVolume(handle: TSoundHandle; volume: Double);
 var
-  i: Integer;
+  p: ^TSoundPool;
 begin
   if (handle < 0) or (handle > High(gSoundPools)) then Exit;
-  if not gSoundPools[handle].valid then Exit;
-  if volume < 0 then volume := 0 else if volume > 1 then volume := 1;
 
-  gSoundPools[handle].volume := volume;
-  for i := 0 to High(gSoundPools[handle].items) do
-    gSoundPools[handle].items[i].el.volume := volume;
+  // clamp
+  if volume < 0 then volume := 0
+  else if volume > 1 then volume := 1;
+
+  p := @gSoundPools[handle];
+  p^.defaultVolume := volume;
+
+  // JEŚLI jest aktywna pętla (np. muzyka) – zmień jej głośność TERAZ
+  if (p^.activeLoop <> nil) and (p^.activeLoop.gain <> nil) then
+    p^.activeLoop.gain.gain.value := volume;
 end;
+
 
 procedure SetSoundLoop(handle: TSoundHandle; looped: Boolean);
 var
-  i: Integer;
+  p: ^TSoundPool;
 begin
   if (handle < 0) or (handle > High(gSoundPools)) then Exit;
-  if not gSoundPools[handle].valid then Exit;
 
-  gSoundPools[handle].looped := looped;
-  for i := 0 to High(gSoundPools[handle].items) do
-    gSoundPools[handle].items[i].el.loop := looped;
+  p := @gSoundPools[handle];
+  p^.looped := looped;
 end;
-
 { ====== FABRYKI ====== }
 function NewVector(ax, ay: Double): TInputVector; begin Result.x := ax; Result.y := ay; end;
 function Vector2Create(x, y: Double): TInputVector; begin Result := NewVector(x, y); end;
@@ -4246,6 +4626,8 @@ var
   cw, ch: Integer;
   opts: TJSObject;
   i: Integer;
+  const
+  DUP_WINDOW_MS = 60.0; // okno na „duplikat” (ms) – możesz dać 30–60
 begin
   // Jeśli DOM niegotowy – opóźnij inicjalizację
   if (document.body = nil) then
@@ -4304,10 +4686,13 @@ begin
 
 
   // ===== Stany wejścia itp. =====
+  // ===== Stany wejścia itp. =====
   gKeys := TJSObject.new;
   gKeysPressed := TJSObject.new;
   gKeysReleased := TJSObject.new;
   gKeyPressedUntil := TJSObject.new; // NEW: ensure exists before first keydown
+  gKeyLastDown := TJSObject.new;     // NEW: mapa czasów ostatniego keydown
+
 
   gMousePos := NewVector(cw / 2, ch / 2);
   gMousePrevPos := gMousePos;
@@ -4328,18 +4713,23 @@ begin
   // ===== Handlery (zapisywane w globalnych zmiennych) =====  to dobre miejsce
 
   // --- Klawiatura ---
- onKeyDownH := function (event: TJSEvent): boolean
+  // --- Klawiatura ---
+
+
+onKeyDownH := function (event: TJSEvent): boolean
 var
   e: TJSKeyBoardEvent;
   k: String;
   isRepeat: Boolean;
   wasDown: Boolean;
+  nowTime, lastTime: Double;
 begin
   e := TJSKeyBoardEvent(event);
 
-  // --- Fallback i normalizacja nazwy klawisza ---
+  // === NORMALIZACJA KLUCZA ===
   k := e.code;
-  if (k = '') then k := e.key;          // np. 'Right'
+  if (k = '') then k := e.key;
+
   if (k = 'Right') then k := 'ArrowRight';
   if (k = 'Left')  then k := 'ArrowLeft';
   if (k = 'Up')    then k := 'ArrowUp';
@@ -4347,74 +4737,176 @@ begin
   if (k = 'NumpadEnter') or (k = 'Return') then k := 'Enter';
   if (k = 'Spacebar') or (k = ' ') or (k = 'Space') then k := 'Space';
 
-  // Inicjalizacja slotów
-  if not gKeys.hasOwnProperty(k) then
+  // === ANTY-DUPLIKAT: drugi keydown tego samego klawisza
+  // w bardzo krótkim czasie ignorujemy ===
+  nowTime  := window.performance.now;
+  lastTime := 0;
+  if (gKeyLastDown <> nil) and gKeyLastDown.hasOwnProperty(k) then
+    lastTime := Double(gKeyLastDown[k]);
+
+  if (nowTime - lastTime) < DUP_WINDOW_MS then
   begin
-    gKeys[k] := false;
-    gKeysPressed[k] := false;
-    gKeysReleased[k] := false;
+    // zignoruj ten event jako duplikat
+    Exit(False);
   end;
 
-  // Bezpiecznie odczytaj auto-repeat (repeat jest słowem kluczowym Pascala)
+  gKeyLastDown[k] := nowTime;
+
+  // === INICJALIZACJA STANÓW ===
+  if not gKeys.hasOwnProperty(k) then
+  begin
+    gKeys[k]        := False;
+    gKeysPressed[k] := False;
+    gKeysReleased[k]:= False;
+  end;
+
+  // === AUTO-REPEAT ===
   isRepeat := False;
   if TJSObject(e).hasOwnProperty('repeat') then
     isRepeat := Boolean(TJSObject(e)['repeat']);
 
+  // blokada „przytrzymania” (systemowe repeat)
+  if isRepeat then
+  begin
+    if gRunning then
+    begin
+      if (k = KEY_SPACE) or
+         (k = KEY_LEFT) or (k = KEY_RIGHT) or
+         (k = KEY_UP)   or (k = KEY_DOWN)  or
+         (k = KEY_ENTER) or
+         (k = KEY_ESCAPE) then
+      begin
+        e.preventDefault;
+        e.stopPropagation;
+      end;
+    end;
+    Exit(False);   // nie traktujemy repeat jako nowego naciśnięcia
+  end;
+
+  // --- RESZTA JAK BYŁO ---
   wasDown := Boolean(gKeys[k]);
 
-  // ✅ Edge TYLKO przy pierwszym fizycznym wciśnięciu (bez auto-repeat)
-  if (not wasDown) and (not isRepeat) then
+  // Krawędź "Pressed" tylko przy przejściu z "nie wciśnięty" -> "wciśnięty"
+  // i tylko przy pierwszym zdarzeniu (bez auto-repeat + bez duplikatu czasowego)
+  if (not wasDown) then
   begin
-    gKeysPressed[k] := true;
-    // hold edge for a short window to avoid misses between frames
+    gKeysPressed[k]     := True;
     gKeyPressedUntil[k] := window.performance.now() + W_KEY_PRESSED_HOLD_MS;
   end;
 
-  // stan trzymania
-  gKeys[k] := true;
+  // Klawisz jest aktualnie wciśnięty
+  gKeys[k] := True;
 
-  if (gCloseOnEscape) and (k = KEY_ESCAPE) then
-    gWantsClose := true;
+  // === BLOKADA DOMYŚLNEGO ZACHOWANIA PRZEGLĄDARKI ===
+  if gRunning then
+  begin
+    // 1) Skróty typu Ctrl+F, Ctrl+P, Ctrl+S itp.
+    if e.ctrlKey or e.metaKey then
+    begin
+      case k of
+        'KeyF', // Ctrl+F – find
+        'KeyP', // Ctrl+P – print
+        'KeyS', // Ctrl+S – save
+        'KeyN', // Ctrl+N – new window
+        'KeyW', // Ctrl+W – close tab
+        'KeyT', // Ctrl+T – new tab
+        'KeyR': // Ctrl+R – refresh
+        begin
+          e.preventDefault;
+          e.stopPropagation;
+          Exit(False);
+        end;
+      end;
+    end;
+
+    // 2) Zwykłe klawisze gry – szczególnie spacja, żeby NIE przewijała strony
+    if (k = KEY_SPACE) or
+       (k = KEY_LEFT) or (k = KEY_RIGHT) or
+       (k = KEY_UP)   or (k = KEY_DOWN)  or
+       (k = KEY_ENTER) or
+       (k = KEY_ESCAPE) then
+    begin
+      e.preventDefault;
+      e.stopPropagation;
+    end;
+  end;
+
+  // Specjalny przypadek: Escape zamyka okno gry
+  if gCloseOnEscape and (k = KEY_ESCAPE) then
+    gWantsClose := True;
 
   Result := True;
 end;
 
 
+
+
   onKeyUpH := function (event: TJSEvent): boolean
   var
     e: TJSKeyBoardEvent;
-    k: String;
+    k, lk: String;
   begin
     e := TJSKeyBoardEvent(event);
 
+    // === NORMALIZACJA TAKA SAMA JAK W KEYDOWN ===
     k := e.code;
     if (k = '') then k := e.key;
+
     if (k = 'Right') then k := 'ArrowRight';
     if (k = 'Left')  then k := 'ArrowLeft';
     if (k = 'Up')    then k := 'ArrowUp';
     if (k = 'Down')  then k := 'ArrowDown';
     if (k = 'NumpadEnter') or (k = 'Return') then k := 'Enter';
-    if (k = 'Space') or (k = ' ') or (k = 'Spacebar') then k := 'Space';
+    if (k = 'Spacebar') or (k = ' ') or (k = 'Space') then k := 'Space';
 
-    
-    // Jeśli canvas ma fokus, blokuj domyślne akcje Enter/Space także na keyup
-    if (document.activeElement = gCanvas) and ((k = KEY_ENTER) or (k = KEY_SPACE)) then
+    // Blokada domyślnych akcji przeglądarki, kiedy gra działa
+    if gRunning then
     begin
-      e.preventDefault();
-      e.stopPropagation();
-    end;
-if not gKeys.hasOwnProperty(k) then
-    begin
-      gKeys[k] := false;
-      gKeysPressed[k] := false;
-      gKeysReleased[k] := false;
+      // 1) Ctrl/Meta skróty, żeby nie "puszczały" akcji po keyup
+      if e.ctrlKey or e.metaKey then
+      begin
+        lk := LowerCase(e.key);
+        if (lk = 'f') or  // Find
+           (lk = 'p') or  // Print
+           (lk = 's') or  // Save
+           (lk = 'n') or  // New window
+           (lk = 'w') or  // Close tab
+           (lk = 't') or  // New tab
+           (lk = 'r')     // Refresh
+        then
+        begin
+          e.preventDefault;
+          e.stopPropagation;
+          Exit(False);
+        end;
+      end;
+
+      // 2) Te same klawisze gry co wyżej – dla porządku
+      if (k = KEY_SPACE) or
+         (k = KEY_LEFT) or (k = KEY_RIGHT) or
+         (k = KEY_UP)   or (k = KEY_DOWN)  or
+         (k = KEY_ENTER) then
+      begin
+        e.preventDefault;
+        e.stopPropagation;
+      end;
     end;
 
-    gKeys[k] := false;
-    gKeysReleased[k] := true;
+    // Inicjalizacja, gdyby przyszedł keyup dla klucza, którego jeszcze nie ma
+    if not gKeys.hasOwnProperty(k) then
+    begin
+      gKeys[k]        := False;
+      gKeysPressed[k] := False;
+      gKeysReleased[k]:= False;
+    end;
+
+    // Stan TRZYMANIA na false, krawędź "Released" na true
+    gKeys[k]        := False;
+    gKeysReleased[k]:= True;
 
     Result := True;
   end;
+
 
 
 window.addEventListener('keydown', onKeyDownH, true); // capture = true
@@ -4650,6 +5142,7 @@ begin
   gKeysPressed := nil;
   gKeysReleased := nil;
   gKeyPressedUntil := nil;
+  gKeyLastDown := nil;
 
 
   // --- PROFILER ---
@@ -4929,22 +5422,83 @@ end;
 procedure DrawText(const text: String; x, y, size: Integer; const color: TColor);
 {$IFDEF WILGA_TEXT_CACHE}
 var
-  st : wilga_text_cache.TTextStyle;
-  tex: wilga_text_cache.TTexture;
+  st  : wilga_text_cache.TTextStyle;
+  tex : wilga_text_cache.TTexture;
+  i, lineStart, lineIdx: Integer;
+  line: String;
+  lineHeight: Integer;
 begin
+  // ======== RESET CAŁEGO STANU KONTEXTU 2D ========
+  gCtx.setTransform(1,0,0,1,0,0);
+  gCtx.globalAlpha := 1.0;
+  gCtx.globalCompositeOperation := 'source-over';
+  gCtx.imageSmoothingEnabled := True;
+  gCtx.shadowBlur := 0;
+  gCtx.shadowOffsetX := 0;
+  gCtx.shadowOffsetY := 0;
+  gCtx.shadowColor := 'rgba(0,0,0,0)';
+  // =================================================
+
+  // ======== USTAWIENIA STYLU (wspólne dla wszystkich linii) ========
   st.SizePx := size;
   st.Family := GFontFamily;
   st.Fill := ColorToRGBA32(color);
+
   st.AlignH := 'left';
   st.AlignV := 'top';
+
   st.OutlinePx := 0;
   st.Outline := ColorToRGBA32(color_BLACK);
-  st.ShadowOffsetX := 0; st.ShadowOffsetY := 0; st.ShadowBlur := 0;
-  st.ShadowColor := ColorToRGBA32(color_TRANSPARENT);
-  st.Padding := 2;
 
-  tex := wilga_text_cache.GetTextTexture(text, st);
-  gCtx.drawImage(tex.canvas, x, y);
+  st.ShadowOffsetX := 0;
+  st.ShadowOffsetY := 0;
+  st.ShadowBlur := 0;
+  st.ShadowColor := ColorToRGBA32(color_TRANSPARENT);
+
+  st.Padding := 2;
+  // ================================================================
+
+  lineHeight := size + size div 3; // prosty odstęp między wierszami
+
+  lineStart := 1;
+  lineIdx   := 0;
+
+  // ======== DZIELENIE TEKSTU PO ENTERACH (#10, #13) ========
+  for i := 1 to Length(text) do
+  begin
+    if (text[i] = #10) or (text[i] = #13) then
+    begin
+      if i > lineStart then
+      begin
+        line := Copy(text, lineStart, i - lineStart);
+
+        // unikalne UID dla danej linii (żeby cache był poprawny)
+        st.UID := TextHash(line) xor (size shl 16) xor st.Fill;
+
+        tex := wilga_text_cache.GetTextTexture(line, st);
+        gCtx.drawImage(tex.canvas, x, y + lineIdx * lineHeight);
+
+        Inc(lineIdx);
+      end;
+      lineStart := i + 1;
+    end;
+  end;
+
+  // ostatnia linia (bez entera na końcu)
+  if lineStart <= Length(text) then
+  begin
+    line := Copy(text, lineStart, Length(text) - lineStart + 1);
+
+    st.UID := TextHash(line) xor (size shl 16) xor st.Fill;
+
+    tex := wilga_text_cache.GetTextTexture(line, st);
+    gCtx.drawImage(tex.canvas, x, y + lineIdx * lineHeight);
+  end;
+
+  // ======== RESET PO RYSOWANIU ========
+  gCtx.setTransform(1,0,0,1,0,0);
+  // =====================================
+
 end;
 {$ELSE}
 var
@@ -4952,6 +5506,9 @@ var
   fontStr   : String;
   measureCtx: TJSCanvasRenderingContext2D;
   m         : JSValue;
+  i, lineStart, lineIdx: Integer;
+  line: String;
+  lineHeight: Integer;
 begin
   // kolor + font tak jak zawsze
   WSetFill(ColorToCanvasRGBA(color));
@@ -4967,25 +5524,62 @@ begin
   measureCtx.setTransform(1, 0, 0, 1, 0, 0);
   measureCtx.font := fontStr;
 
-  // mierzymy ascent podobnie jak wilga_text_cache
-  m := measureCtx.measureText(text);
-
-  asm
-    var mm = m;
-    if (mm && mm.actualBoundingBoxAscent !== undefined) {
-      asc = Number(mm.actualBoundingBoxAscent);
-    } else {
-      asc = 0.80 * size; // fallback jak w text-cache
-    }
-  end;
-
   // baseline jak w text-cache
   gCtx.textBaseline := 'alphabetic';
-  // przesuwamy Y o ascent, żeby górna krawędź tekstu była w tym samym miejscu
-  gCtx.fillText(text, x, y + asc);
+
+  lineHeight := size + size div 3;
+
+  lineStart := 1;
+  lineIdx   := 0;
+
+  // ======== DZIELENIE TEKSTU PO ENTERACH (#10, #13) ========
+  for i := 1 to Length(text) do
+  begin
+    if (text[i] = #10) or (text[i] = #13) then
+    begin
+      if i > lineStart then
+      begin
+        line := Copy(text, lineStart, i - lineStart);
+
+        // mierzymy ascent dla TEJ linii
+        m := measureCtx.measureText(line);
+
+        asm
+          var mm = m;
+          if (mm && mm.actualBoundingBoxAscent !== undefined) {
+            asc = Number(mm.actualBoundingBoxAscent);
+          } else {
+            asc = 0.80 * size; // fallback jak w text-cache
+          }
+        end;
+
+        gCtx.fillText(line, x, y + lineIdx * lineHeight + asc);
+        Inc(lineIdx);
+      end;
+      lineStart := i + 1;
+    end;
+  end;
+
+  // ostatnia linia (bez entera na końcu)
+  if lineStart <= Length(text) then
+  begin
+    line := Copy(text, lineStart, Length(text) - lineStart + 1);
+
+    m := measureCtx.measureText(line);
+
+    asm
+      var mm = m;
+      if (mm && mm.actualBoundingBoxAscent !== undefined) {
+        asc = Number(mm.actualBoundingBoxAscent);
+      } else {
+        asc = 0.80 * size;
+      }
+    end;
+
+    gCtx.fillText(line, x, y + lineIdx * lineHeight + asc);
+  end;
 end;
 {$ENDIF}
-
 
 function MeasureTextWidth(const text: String; size: Integer): Double;
 var
@@ -5478,6 +6072,7 @@ begin
     gKeysReleased[key] := false;
   end;
 end;
+
 function KeyCodeToCode(keyCode: Integer): String;
 begin
   case keyCode of
@@ -5547,6 +6142,48 @@ begin
   Result := ''; // fallback – brak mapy
 end;
 
+function IsKeyPressed(const code: String): Boolean; overload;
+begin
+  // Zwróć TRUE tylko jeśli w TEJ ramce był „Pressed”
+  // (ustawione w onKeyDownH przy przejściu z not wasDown)
+  if gKeysPressed.hasOwnProperty(code) and Boolean(gKeysPressed[code]) then
+    Exit(True);
+
+  // Modyfikatory – traktuj lewy/prawy razem
+  if (code = 'ShiftLeft') or (code = 'ShiftRight') then
+  begin
+    if (gKeysPressed.hasOwnProperty('ShiftLeft')  and Boolean(gKeysPressed['ShiftLeft'])) or
+       (gKeysPressed.hasOwnProperty('ShiftRight') and Boolean(gKeysPressed['ShiftRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'ControlLeft') or (code = 'ControlRight') then
+  begin
+    if (gKeysPressed.hasOwnProperty('ControlLeft')  and Boolean(gKeysPressed['ControlLeft'])) or
+       (gKeysPressed.hasOwnProperty('ControlRight') and Boolean(gKeysPressed['ControlRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'AltLeft') or (code = 'AltRight') then
+  begin
+    if (gKeysPressed.hasOwnProperty('AltLeft')  and Boolean(gKeysPressed['AltLeft'])) or
+       (gKeysPressed.hasOwnProperty('AltRight') and Boolean(gKeysPressed['AltRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'MetaLeft') or (code = 'MetaRight') then
+  begin
+    if (gKeysPressed.hasOwnProperty('MetaLeft')  and Boolean(gKeysPressed['MetaLeft'])) or
+       (gKeysPressed.hasOwnProperty('MetaRight') and Boolean(gKeysPressed['MetaRight'])) then
+      Exit(True);
+  end;
+
+  Result := False;
+end;
+
+
+
+
 function IsKeyPressed(keyCode: Integer): Boolean; overload;
 var
   c: String;
@@ -5557,41 +6194,9 @@ begin
 end;
 
 
-function IsKeyPressed(const code: String): Boolean; overload;
-var
-  untilMS: Double;
-begin
-  Result := False;
-
-  // --- fallback: okno HOLD krawędzi (gKeyPressedUntil) ---
-  if (gKeyPressedUntil <> nil) and gKeyPressedUntil.hasOwnProperty(code) then
-  begin
-    untilMS := Double(gKeyPressedUntil[code]);
-    if window.performance.now() <= untilMS then
-    begin
-      gKeyPressedUntil[code] := 0;
-      Exit(True);
-    end;
-  end;
-
-
-  // Paruj tylko modyfikatory:
-  if (code = 'ShiftLeft') and gKeysPressed.hasOwnProperty('ShiftRight') and Boolean(gKeysPressed['ShiftRight']) then
-  begin gKeysPressed['ShiftRight'] := false; Exit(True); end;
-
-  if (code = 'ControlLeft') and gKeysPressed.hasOwnProperty('ControlRight') and Boolean(gKeysPressed['ControlRight']) then
-  begin gKeysPressed['ControlRight'] := false; Exit(True); end;
-
-  if (code = 'AltLeft') and gKeysPressed.hasOwnProperty('AltRight') and Boolean(gKeysPressed['AltRight']) then
-  begin gKeysPressed['AltRight'] := false; Exit(True); end;
-
-  if (code = 'MetaLeft') and gKeysPressed.hasOwnProperty('MetaRight') and Boolean(gKeysPressed['MetaRight']) then
-  begin gKeysPressed['MetaRight'] := false; Exit(True); end;
-
-  Result := False;
-end;
 function IsKeyDown(keyCode: Integer): Boolean; overload;
-var c: String;
+var
+  c: String;
 begin
   c := KeyCodeToCode(keyCode);
   if c = '' then Exit(False);
@@ -5599,35 +6204,91 @@ begin
 end;
 function IsKeyDown(const code: String): Boolean; overload;
 begin
-  if gKeys.hasOwnProperty(code) and Boolean(gKeys[code]) then Exit(True);
+  // stan TRZYMANIA (bez kasowania)
+  if gKeys.hasOwnProperty(code) and Boolean(gKeys[code]) then
+    Exit(True);
 
-  // Paruj tylko modyfikatory:
-  if (code = 'ShiftLeft')   and gKeys.hasOwnProperty('ShiftRight')   and Boolean(gKeys['ShiftRight'])   then Exit(True);
-  if (code = 'ControlLeft') and gKeys.hasOwnProperty('ControlRight') and Boolean(gKeys['ControlRight']) then Exit(True);
-  if (code = 'AltLeft')     and gKeys.hasOwnProperty('AltRight')     and Boolean(gKeys['AltRight'])     then Exit(True);
-  if (code = 'MetaLeft')    and gKeys.hasOwnProperty('MetaRight')    and Boolean(gKeys['MetaRight'])    then Exit(True);
+  // parowanie modyfikatorów (opcjonalnie, jak u Ciebie)
+  if (code = 'ShiftLeft') or (code = 'ShiftRight') then
+  begin
+    if gKeys.hasOwnProperty('ShiftLeft')  and Boolean(gKeys['ShiftLeft'])  then Exit(True);
+    if gKeys.hasOwnProperty('ShiftRight') and Boolean(gKeys['ShiftRight']) then Exit(True);
+  end;
+
+  if (code = 'ControlLeft') or (code = 'ControlRight') then
+  begin
+    if gKeys.hasOwnProperty('ControlLeft')  and Boolean(gKeys['ControlLeft'])  then Exit(True);
+    if gKeys.hasOwnProperty('ControlRight') and Boolean(gKeys['ControlRight']) then Exit(True);
+  end;
+
+  if (code = 'AltLeft') or (code = 'AltRight') then
+  begin
+    if gKeys.hasOwnProperty('AltLeft')  and Boolean(gKeys['AltLeft'])  then Exit(True);
+    if gKeys.hasOwnProperty('AltRight') and Boolean(gKeys['AltRight']) then Exit(True);
+  end;
+
+  if (code = 'MetaLeft') or (code = 'MetaRight') then
+  begin
+    if gKeys.hasOwnProperty('MetaLeft')  and Boolean(gKeys['MetaLeft'])  then Exit(True);
+    if gKeys.hasOwnProperty('MetaRight') and Boolean(gKeys['MetaRight']) then Exit(True);
+  end;
 
   Result := False;
 end;
 
 function IsKeyReleased(const code: String): Boolean; overload;
-var wasReleased: Boolean;
 begin
-  if not gKeysReleased.hasOwnProperty(code) then
-    Exit(False);
+  // Jednorazowa krawędź Released – stan na tę ramkę (bez czyszczenia tutaj)
+  if gKeysReleased.hasOwnProperty(code) and Boolean(gKeysReleased[code]) then
+    Exit(True);
 
-  wasReleased := Boolean(gKeysReleased[code]);
-  if wasReleased then gKeysReleased[code] := false;
-  Result := wasReleased;
+  // Modyfikatory – lewy/prawy traktowane razem (ale bez kasowania, bo i tak
+  // czyścimy gKeysReleased globalnie raz na klatkę w GlobalAnimFrame)
+
+
+  if (code = 'ShiftLeft') or (code = 'ShiftRight') then
+  begin
+    if (gKeysReleased.hasOwnProperty('ShiftLeft')  and Boolean(gKeysReleased['ShiftLeft'])) or
+       (gKeysReleased.hasOwnProperty('ShiftRight') and Boolean(gKeysReleased['ShiftRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'ControlLeft') or (code = 'ControlRight') then
+  begin
+    if (gKeysReleased.hasOwnProperty('ControlLeft')  and Boolean(gKeysReleased['ControlLeft'])) or
+       (gKeysReleased.hasOwnProperty('ControlRight') and Boolean(gKeysReleased['ControlRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'AltLeft') or (code = 'AltRight') then
+  begin
+    if (gKeysReleased.hasOwnProperty('AltLeft')  and Boolean(gKeysReleased['AltLeft'])) or
+       (gKeysReleased.hasOwnProperty('AltRight') and Boolean(gKeysReleased['AltRight'])) then
+      Exit(True);
+  end;
+
+  if (code = 'MetaLeft') or (code = 'MetaRight') then
+  begin
+    if (gKeysReleased.hasOwnProperty('MetaLeft')  and Boolean(gKeysReleased['MetaLeft'])) or
+       (gKeysReleased.hasOwnProperty('MetaRight') and Boolean(gKeysReleased['MetaRight'])) then
+      Exit(True);
+  end;
+
+  Result := False;
 end;
 
+
+
+
 function IsKeyReleased(keyCode: Integer): Boolean; overload;
-var c: String;
+var
+  c: String;
 begin
   c := KeyCodeToCode(keyCode);
   if c = '' then Exit(False);
   Result := IsKeyReleased(c);
 end;
+
 
 
 function GetAllPressedKeys: array of String;
@@ -5671,7 +6332,12 @@ end;
 
 function GetCharPressed: String;
 begin
-  Result := GetKeyPressed;
+  if (gCharQueue.length > 0) then
+  begin
+    Result := String(gCharQueue.shift); // zdejmij pierwszy
+  end
+  else
+    Result := '';
 end;
 
 { ====== PROFILER ====== }
@@ -5771,11 +6437,15 @@ var
   stepMs, stepSec: Double;
   instFps: Double;
   steps, i: Integer;
+
+  
+  k: String;
 const
   EPS_MS    = 2.0;
   FIXED_FPS = 60;
   MAX_STEPS = 5;
   FPS_ALPHA = 0.12;
+
 begin
   // jeśli ktoś zatrzymał pętlę z zewnątrz – wyjdź
   if not gRunning then Exit;
@@ -5825,8 +6495,9 @@ begin
   W_EnsureInputInit;
   W_InputBeginFrame;
   // --- stały krok aktualizacji
+  // --- stały krok aktualizacji
   steps := 0;
-  while (gTimeAccum >= stepMs) and (steps < MAX_STEPS) do
+while (gTimeAccum >= stepMs) and (steps < MAX_STEPS) do
   begin
     gLastDt := stepSec;
 
@@ -5836,6 +6507,11 @@ begin
     // Update systemów cząsteczek (jak było)
     for i := 0 to High(gParticleSystems) do
       gParticleSystems[i].Update(gLastDt);
+
+    // 🔹 PO JEDNYM KROKU UPDATE: czyścimy krawędzie klawiszy
+    //    (Pressed/Released widoczne tylko w TEJ jednej iteracji pętli)
+    gKeysPressed  := TJSObject.New;
+    gKeysReleased := TJSObject.New;
 
     gTimeAccum := gTimeAccum - stepMs;
     Inc(steps);
@@ -5848,6 +6524,8 @@ begin
       Exit;
     end;
   end;
+
+
 
   // jeżeli dojechaliśmy do MAX_STEPS, przytnij nadmiar, by nie „ciągnąć ogona”
   if steps = MAX_STEPS then
@@ -5879,14 +6557,18 @@ begin
   {$ENDIF}{$ENDIF}
 
   // --- Per-frame input state sync (ważne dla IsMouseButtonPressed/Released)
+  // --- Per-frame input state sync (ważne dla IsMouseButtonPressed/Released)
   gMouseButtonsPrev[0] := gMouseButtonsDown[0];
   gMouseButtonsPrev[1] := gMouseButtonsDown[1];
   gMouseButtonsPrev[2] := gMouseButtonsDown[2];
   gMousePrevPos := gMousePos;
 
-  // Zresetuj „frame-based” stany klawiszy i kółka
-  gKeysPressed  := TJSObject.new;
-  gKeysReleased := TJSObject.new;
+  // Zresetuj „frame-based” stany klawiszy (pressed/released)
+  // Tworzymy nowe, puste obiekty – jakby „czyścimy mapę”.
+ // gKeysPressed  := TJSObject.New;
+  //gKeysReleased := TJSObject.New;
+
+  // Zresetuj kółko myszy
   gMouseWheelDelta := 0;
 
   // FPS wygładzony
@@ -5894,6 +6576,8 @@ begin
     instFps := 1000.0
   else
     instFps := 1000.0 / elapsedMs;
+
+
 
   if gCurrentFps <= 0 then
     gCurrentFps := Longint(Round(instFps))
@@ -7270,7 +7954,6 @@ end;
     begin
       W_CurrDown[b]     := False;
       W_ReleasedNext[b] := True;  // zatrzask na następną ramkę
-      // W_PressedUntilMS[b] zostaw — jeśli było świeże DOWN, hold zapewni widoczność pressed
     end;
 
   // Uwaga: gMouseWheelDelta zeruj w W_InputEndFrame (po Draw).
@@ -7288,14 +7971,38 @@ begin
 end;
 
 function IsMouseButtonPressed(btn: Integer): Boolean;
+var
+  cur: Boolean;
 begin
-  Result := (btn >= 0) and (btn <= 2) and W_Pressed[btn];
+  if (btn < 0) or (btn > 2) then
+    Exit(False);
+
+  // to jest flaga "był klik" z uwzględnieniem niskiego FPS (W_PressedUntilMS)
+  cur := W_Pressed[btn];
+
+  // edge: było False, stało się True -> jedno "kliknięcie"
+  Result := cur and (not GMousePrevPressed[btn]);
+
+  // zapamiętujemy, co widzieliśmy w tej klatce
+  GMousePrevPressed[btn] := cur;
 end;
 
 function IsMouseButtonReleased(btn: Integer): Boolean;
+var
+  cur: Boolean;
 begin
-  Result := (btn >= 0) and (btn <= 2) and W_Released[btn];
+  if (btn < 0) or (btn > 2) then
+    Exit(False);
+
+  // Wilga już przygotowuje W_Released[btn] z uwzględnieniem niskiego FPS
+  cur := W_Released[btn];
+
+  Result := cur and (not GMousePrevReleased[btn]);
+
+  GMousePrevReleased[btn] := cur;
 end;
+
+
 
 function IsMouseDoubleClicked(btn: Integer): Boolean;
 begin
@@ -7332,7 +8039,7 @@ end;
 
 // === Kolejka event-accurate klików ===
 const
-  W_CLICKBUF_CAP = 128; // pojemność kolejki klików
+  W_CLICKBUF_CAP = 228; // pojemność kolejki klików
 
 type
   TClickItem = record
@@ -7562,7 +8269,7 @@ begin
       window.addEventListener('blur',             () => forceAllUp(), { passive:true });
       document.addEventListener('visibilitychange', () => { if (document.hidden) forceAllUp(); }, { passive:true });
 
-      // wheel (jeżeli masz handler)
+      // wheel 
       c.addEventListener('wheel', (e) => {
         if (resolve('W_OnWheel')) {
           call('W_OnWheel', [ (e.deltaY > 0 ? 1 : -1) | 0 ]);

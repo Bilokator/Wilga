@@ -22,6 +22,8 @@ type
     ShadowBlur: Integer;
     ShadowColor: Cardinal;
     Padding: Integer;
+    UID: Integer;
+
   end;
 
   // Offscreen „tekstura” (canvas) trzymana w cache
@@ -46,7 +48,7 @@ function  GetTextTexture(const Text: String; const S: TTextStyle): TTexture;
 procedure TextCache_BeginFrame; // wołaj na starcie klatki
 procedure TextCache_GetStats(out Hits, Misses, Created, Evicted,
                              FrameHits, FrameMisses: NativeInt);
-
+function TextHash(const s: String): Cardinal;
 implementation
 
 type
@@ -70,11 +72,13 @@ begin
     var worker = window.__wilgaRenderWorker;
     if (!worker || !cnv || typeof createImageBitmap !== 'function') return;
 
-    // globalny licznik ID tekstur współdzielony przez WSZYSTKIE canvasy
-    if (!cnv.__wilgaTexId) {
-      if (!window.__wilgaNextTexId) window.__wilgaNextTexId = 1;
-      cnv.__wilgaTexId = window.__wilgaNextTexId++;
-    }
+    // ---- TEXT-ID SEPARATED ----
+    if (!window.__wilgaTextNextTexId)
+      window.__wilgaTextNextTexId = 1000000;
+
+    if (!cnv.__wilgaTexId)
+      cnv.__wilgaTexId = window.__wilgaTextNextTexId++;  // teksty zaczynają od 1,000,000
+
     var id = cnv.__wilgaTexId;
 
     createImageBitmap(cnv).then(function(bmp) {
@@ -85,6 +89,7 @@ begin
     });
   end;
 end;
+
 
 function ColorToCanvasRGBA(const C: Cardinal): String; inline;
 var r,g,b,a: Byte;
@@ -132,20 +137,17 @@ end;
 
 function MakeKey(const Text: String; const S: TTextStyle): String; inline;
 begin
+  // TYLKO te pola wpływają REALNIE na wygląd bitmapy
   Result :=
-    'f=' + BuildFontString(S.SizePx, S.Family) +
-    '|t=' + Text +
+    'font='  + BuildFontString(S.SizePx, S.Family) +
+    '|text=' + Text +
     '|fill=' + IntToHex(S.Fill, 8) +
-    '|outpx=' + IntToStr(S.OutlinePx) +
-    '|out=' + IntToHex(S.Outline, 8) +
-    '|ah=' + S.AlignH +
-    '|av=' + S.AlignV +
-    '|sx=' + IntToStr(S.ShadowOffsetX) +
-    '|sy=' + IntToStr(S.ShadowOffsetY) +
-    '|sb=' + IntToStr(S.ShadowBlur) +
-    '|sc=' + IntToHex(S.ShadowColor, 8) +
-    '|pad=' + IntToStr(S.Padding);
+    '|outlinepx=' + IntToStr(S.OutlinePx) +
+    '|outline='   + IntToHex(S.Outline, 8)+
+    '|uid=' + IntToStr(S.UID);
+
 end;
+
 
 function MeasureText(ctx: TJSCanvasRenderingContext2D; const s: String; fontPx: Integer): TTextMetricsI;
 var w, asc, desc: Double;
@@ -161,6 +163,17 @@ begin
   Result.asc  := Ceil(asc);
   Result.desc := Ceil(desc);
 end;
+function TextHash(const s: String): Cardinal;
+var
+  i: Integer;
+begin
+  Result := 2166136261;
+  for i := 1 to Length(s) do
+  begin
+    Result := Result xor Ord(s[i]);
+    Result := Result * 16777619;
+  end;
+end;
 
 function BuildTextTexture(const Text: String; const S: TTextStyle): TTexture;
 var
@@ -172,47 +185,57 @@ var
   m: TTextMetricsI;
   asc, desc, totalH: Integer;
 begin
-  // 1) Pomiar
+  // 1) Pomiar (krótki canvas tymczasowy)
   cnv := MakeOffscreenCanvas(1,1);
   ctx := TJSCanvasRenderingContext2D(cnv.getContext('2d'));
+
   fontStr := BuildFontString(S.SizePx, S.Family);
   ctx.font := fontStr;
 
   m := MeasureText(ctx, Text, S.SizePx);
-  asc := m.asc; desc := m.desc;
+  asc := m.asc;
+  desc := m.desc;
 
   pad := Max(0, S.Padding);
   totalH := asc + desc;
-  w := Max(1, m.w + pad*2);
-  h := Max(1, totalH + pad*2);
 
-  // 2) Render do docelowego offscreen
+  w := Max(1, m.w + pad * 2);
+  h := Max(1, totalH + pad * 2);
+
+  // 2) Docelowy canvas
   cnv := MakeOffscreenCanvas(w, h);
   ctx := TJSCanvasRenderingContext2D(cnv.getContext('2d'));
+
+  // --- ✨ KLUCZOWE POPRAWKI CACHE ✨ ---
+  ctx.setTransform(1, 0, 0, 1, 0, 0); // reset transformacji
+  ctx.clearRect(0, 0, w, h);          // ZAWSZE czyść recyklingowane canvasy
+
+  // ustawienia fontu
   ctx.font := fontStr;
-
-  // W cache rysujemy ZAWSZE na 'alphabetic' baseline,
-  // a AlignV mapujemy do pozycji linii bazowej.
   ctx.textBaseline := 'alphabetic';
-  ctx.textAlign := S.AlignH;
 
-  // X: klasycznie
-  if S.AlignH = 'center' then drawX := w * 0.5
-  else if S.AlignH = 'right' then drawX := w - pad
-  else drawX := pad;
+  // textAlign w cache musi być zawsze left
+  // (wyrównanie poziome obsługuje drawX)
+  ctx.textAlign := 'left';
+  // -----------------------------------
 
-  // Y: oblicz pozycję linii bazowej względem 'alphabetic'
-  if (S.AlignV = 'top') then
-    // chcemy, by górny asc był równy pad
+  // X
+  if S.AlignH = 'center' then
+    drawX := (w * 0.5)
+  else if S.AlignH = 'right' then
+    drawX := w - pad
+  else
+    drawX := pad;
+
+  // Y – mapowanie AlignV
+  if S.AlignV = 'top' then
     drawY := pad + asc
-  else if (S.AlignV = 'middle') then
-    // środek optyczny (asc - desc)/2 trafia w środek obrazu
+  else if S.AlignV = 'middle' then
     drawY := (h * 0.5) + (asc - desc) * 0.5
-  else if (S.AlignV = 'bottom') then
-    // chcemy, by dół (desc) był przy dolnym padzie
+  else if S.AlignV = 'bottom' then
     drawY := h - pad - desc
-  else // 'alphabetic'
-    // naturalna linia bazowa tuż nad dolnym paddingiem
+  else
+    // 'alphabetic'
     drawY := h - pad - desc;
 
   // Cień
@@ -239,34 +262,50 @@ begin
   ctx.fillStyle := ColorToCanvasRGBA(S.Fill);
   ctx.fillText(Text, drawX, drawY);
 
+  // tworzymy teksturę do cache
   Result := CreateTextureFromCanvas(cnv);
 end;
 
 
+
 procedure InsertItem(const Key: String; const Tex: TTexture);
-var idx: Integer;
+var
+  idx: Integer;
 begin
   if GIndex = nil then
     GIndex := TJSMap.new;
 
   if Length(GItems) < GCap then
   begin
-    SetLength(GItems, Length(GItems)+1);
+    // jeszcze nie zapełniliśmy cache – dokładamy nowy slot
+    SetLength(GItems, Length(GItems) + 1);
     idx := High(GItems);
   end
   else
   begin
+    // recykling starego slotu w stylu "ring buffer"
     idx := GPtr mod GCap;
+
+    // ⚠️ KLUCZOWA POPRAWKA: usuń stary wpis z mapy
+    if (GItems[idx].Key <> '') and (GIndex <> nil) then
+      GIndex.delete(GItems[idx].Key);
+
     if GItems[idx].Tex.loaded then
       ReleaseTexture(GItems[idx].Tex);
+
     Inc(GEvicted);
   end;
 
+  // wpisujemy nowy element
   GItems[idx].Key := Key;
   GItems[idx].Tex := Tex;
-  GIndex.&set(Key, idx); // 'set' jest słowem kluczowym w Pascalu -> użyj &set
+
+  // aktualizujemy mapę: nowy klucz -> nowy indeks
+  GIndex.&set(Key, idx);
+
   Inc(GPtr);
 end;
+
 
 function FindIndex(const Key: String): Integer;
 var v: JSValue;
