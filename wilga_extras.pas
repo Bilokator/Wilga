@@ -489,6 +489,45 @@ implementation
 
 var
   gLights: array of TWilgaLight;
+function W_LineHeight(size: Integer): Integer;
+begin
+  if size < 1 then size := 1;
+  Result := size + size div 3; // tak samo jak w DrawText
+end;
+
+function W_PrefixWithCRLF(const s: String; visibleGlyphs: Integer): String;
+var
+  i, glyphs: Integer;
+begin
+  if visibleGlyphs <= 0 then Exit('');
+
+  i := 1;
+  glyphs := 0;
+  while (i <= Length(s)) and (glyphs < visibleGlyphs) do
+  begin
+    // CRLF traktuj jako JEDNO złamanie linii
+    if (s[i] = #13) then
+    begin
+      Inc(glyphs);
+      Inc(i);
+      if (i <= Length(s)) and (s[i] = #10) then Inc(i);
+      Continue;
+    end;
+
+    if (s[i] = #10) then
+    begin
+      Inc(glyphs);
+      Inc(i);
+      Continue;
+    end;
+
+    Inc(glyphs);
+    Inc(i);
+  end;
+
+  // utnij do pozycji i-1 (i już wskazuje "za" tym, co ma być widoczne)
+  Result := Copy(s, 1, i - 1);
+end;
 
 function W_LightColorFromTemperature(temp: Double): TColor;
 var
@@ -2747,48 +2786,70 @@ begin
 end;
 
 // Efekt "typewriter" (pojawianie się liter z czasem)
-procedure DrawTextTypewriter(const text: String; pos: TVector2; fontSize: Integer; const color: TColor; elapsedTime: Double; charsPerSecond: Double);
+procedure DrawTextTypewriter(const text: String; pos: TVector2; fontSize: Integer;
+  const color: TColor; elapsedTime: Double; charsPerSecond: Double);
 var
   visibleChars: Integer;
+  prefix: String;
 begin
   visibleChars := Trunc(elapsedTime * charsPerSecond);
-  if visibleChars > Length(text) then
-    visibleChars := Length(text);
-  DrawText(Copy(text, 1, visibleChars), Round(pos.x), Round(pos.y), fontSize, color);
+  if visibleChars < 0 then visibleChars := 0;
+
+  prefix := W_PrefixWithCRLF(text, visibleChars);
+  DrawText(prefix, Round(pos.x), Round(pos.y), fontSize, color);
 end;
 
 procedure DrawTextWave(const text: String; pos: TVector2; fontSize: Integer;
   const color: TColor; time: Double; amplitude, speed: Double);
 var
-  i        : Integer;
-  x, y     : Double;
-  ch       : String;
-  effSize  : Longint;
+  i: Integer;
+  x0, x, y0, y: Double;
+  ch: String;
+  effSize: Longint;
+  lineH: Integer;
 begin
-  // 0 => użyj bieżącego globalnego rozmiaru
-  if fontSize > 0 then
-    effSize := fontSize
-  else
-    effSize := GFontSize;
+  if fontSize > 0 then effSize := fontSize else effSize := GFontSize;
+  if effSize < 1 then effSize := 1;
 
-  if effSize < 1 then
-    effSize := 1;
-
-  // Jeśli podano fontSize > 0, ustawiamy go globalnie (Wilga używa GFontSize)
   if (fontSize > 0) and (GFontSize <> effSize) then
     EnsureFont(effSize);
 
-  x := pos.x;
-  for i := 1 to Length(text) do
+  lineH := W_LineHeight(effSize);
+
+  x0 := pos.x;
+  y0 := pos.y;
+  x := x0;
+
+  i := 1;
+  while i <= Length(text) do
   begin
-    y  := pos.y + Sin(time * speed + i * 0.5) * amplitude;
+    // newline: CRLF / CR / LF
+    if text[i] = #13 then
+    begin
+      x := x0;
+      y0 := y0 + lineH;
+      Inc(i);
+      if (i <= Length(text)) and (text[i] = #10) then Inc(i);
+      Continue;
+    end;
+    if text[i] = #10 then
+    begin
+      x := x0;
+      y0 := y0 + lineH;
+      Inc(i);
+      Continue;
+    end;
+
+    y  := y0 + Sin(time * speed + i * 0.5) * amplitude;
     ch := text[i];
 
-    // Rysujemy i mierzymy w tym samym, efektywnym rozmiarze
     DrawText(ch, Round(x), Round(y), effSize, color);
     x += MeasureTextWidth(ch, effSize);
+
+    Inc(i);
   end;
 end;
+
 
 // Efekt "pulsowanie"
 procedure DrawTextPulseRange(const text: String; const pos: TVector2;
@@ -2830,26 +2891,51 @@ begin
     EnsureFont(oldSize);
 end;
 
-
-
-
-procedure DrawTextShake(const text: String; pos: TVector2; fontSize: Integer; const color: TColor; time: Double; intensity: Double);
+procedure DrawTextShake(const text: String; pos: TVector2; fontSize: Integer;
+  const color: TColor; time: Double; intensity: Double);
 var
   i: Integer;
   offsetX, offsetY: Double;
-  x: Double;
+  x0, x, y0: Double;
   ch: String;
+  lineH: Integer;
 begin
-  x := pos.x;
-  for i := 1 to Length(text) do
+  lineH := W_LineHeight(fontSize);
+
+  x0 := pos.x;
+  y0 := pos.y;
+  x  := x0;
+
+  i := 1;
+  while i <= Length(text) do
   begin
+    if text[i] = #13 then
+    begin
+      x := x0;
+      y0 := y0 + lineH;
+      Inc(i);
+      if (i <= Length(text)) and (text[i] = #10) then Inc(i);
+      Continue;
+    end;
+    if text[i] = #10 then
+    begin
+      x := x0;
+      y0 := y0 + lineH;
+      Inc(i);
+      Continue;
+    end;
+
     offsetX := (Random - 0.5) * intensity;
     offsetY := (Random - 0.5) * intensity;
     ch := text[i];
-    DrawText(ch, Round(x + offsetX), Round(pos.y + offsetY), fontSize, color);
+
+    DrawText(ch, Round(x + offsetX), Round(y0 + offsetY), fontSize, color);
     x += MeasureTextWidth(ch, fontSize);
+
+    Inc(i);
   end;
 end;
+
 procedure DrawTriangleStrip(const pts: array of TInputVector; const color: TColor;
   filled: Boolean; thickness: Integer);
 var

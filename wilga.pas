@@ -3337,6 +3337,42 @@ end;
 
 
 // === Tekst ===
+
+type
+  TStringArray = array of String;
+
+function W_SplitLines(const s: String): TStringArray;
+var
+  i, startIdx: Integer;
+  ch: Char;
+begin
+  SetLength(Result, 0);
+  if s = '' then Exit;
+
+  startIdx := 1;
+  i := 1;
+  while i <= Length(s) do
+  begin
+    ch := s[i];
+    if (ch = #10) or (ch = #13) then
+    begin
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Copy(s, startIdx, i - startIdx);
+
+      // consume CRLF as one newline
+      if (ch = #13) and (i < Length(s)) and (s[i + 1] = #10) then
+        Inc(i);
+
+      startIdx := i + 1;
+    end;
+    Inc(i);
+  end;
+
+  // last line (can be empty)
+  SetLength(Result, Length(Result) + 1);
+  Result[High(Result)] := Copy(s, startIdx, Length(s) - startIdx + 1);
+end;
+
 procedure ApplyFont;
 begin
   SetTextFont(BuildFontString(GFontSize));
@@ -5424,10 +5460,13 @@ procedure DrawText(const text: String; x, y, size: Integer; const color: TColor)
 var
   st  : wilga_text_cache.TTextStyle;
   tex : wilga_text_cache.TTexture;
-  i, lineStart, lineIdx: Integer;
+  lines: TStringArray;
   line: String;
+  lineIdx: Integer;
   lineHeight: Integer;
 begin
+  if text = '' then Exit;
+
   // ======== RESET CAŁEGO STANU KONTEXTU 2D ========
   gCtx.setTransform(1,0,0,1,0,0);
   gCtx.globalAlpha := 1.0;
@@ -5458,37 +5497,21 @@ begin
   st.Padding := 2;
   // ================================================================
 
-  lineHeight := size + size div 3; // prosty odstęp między wierszami
-
-  lineStart := 1;
-  lineIdx   := 0;
+  // Zostawiamy kompatybilne odstępy jak było wcześniej:
+  lineHeight := size + size div 3;
 
   // ======== DZIELENIE TEKSTU PO ENTERACH (#10, #13) ========
-  for i := 1 to Length(text) do
+  // CRLF traktujemy jako jedno łamanie. Puste linie przesuwają Y (lineIdx),
+  // ale nic nie rysują.
+  lines := W_SplitLines(text);
+
+  for lineIdx := 0 to High(lines) do
   begin
-    if (text[i] = #10) or (text[i] = #13) then
-    begin
-      if i > lineStart then
-      begin
-        line := Copy(text, lineStart, i - lineStart);
+    line := lines[lineIdx];
+    if line = '' then
+      Continue;
 
-        // unikalne UID dla danej linii (żeby cache był poprawny)
-        st.UID := TextHash(line) xor (size shl 16) xor st.Fill;
-
-        tex := wilga_text_cache.GetTextTexture(line, st);
-        gCtx.drawImage(tex.canvas, x, y + lineIdx * lineHeight);
-
-        Inc(lineIdx);
-      end;
-      lineStart := i + 1;
-    end;
-  end;
-
-  // ostatnia linia (bez entera na końcu)
-  if lineStart <= Length(text) then
-  begin
-    line := Copy(text, lineStart, Length(text) - lineStart + 1);
-
+    // unikalne UID dla danej linii (żeby cache był poprawny)
     st.UID := TextHash(line) xor (size shl 16) xor st.Fill;
 
     tex := wilga_text_cache.GetTextTexture(line, st);
@@ -5498,7 +5521,6 @@ begin
   // ======== RESET PO RYSOWANIU ========
   gCtx.setTransform(1,0,0,1,0,0);
   // =====================================
-
 end;
 {$ELSE}
 var
@@ -5506,10 +5528,13 @@ var
   fontStr   : String;
   measureCtx: TJSCanvasRenderingContext2D;
   m         : JSValue;
-  i, lineStart, lineIdx: Integer;
-  line: String;
+  lines     : TStringArray;
+  line      : String;
+  lineIdx   : Integer;
   lineHeight: Integer;
 begin
+  if text = '' then Exit;
+
   // kolor + font tak jak zawsze
   WSetFill(ColorToCanvasRGBA(color));
   EnsureFont(size);
@@ -5529,41 +5554,13 @@ begin
 
   lineHeight := size + size div 3;
 
-  lineStart := 1;
-  lineIdx   := 0;
+  lines := W_SplitLines(text);
 
-  // ======== DZIELENIE TEKSTU PO ENTERACH (#10, #13) ========
-  for i := 1 to Length(text) do
+  for lineIdx := 0 to High(lines) do
   begin
-    if (text[i] = #10) or (text[i] = #13) then
-    begin
-      if i > lineStart then
-      begin
-        line := Copy(text, lineStart, i - lineStart);
-
-        // mierzymy ascent dla TEJ linii
-        m := measureCtx.measureText(line);
-
-        asm
-          var mm = m;
-          if (mm && mm.actualBoundingBoxAscent !== undefined) {
-            asc = Number(mm.actualBoundingBoxAscent);
-          } else {
-            asc = 0.80 * size; // fallback jak w text-cache
-          }
-        end;
-
-        gCtx.fillText(line, x, y + lineIdx * lineHeight + asc);
-        Inc(lineIdx);
-      end;
-      lineStart := i + 1;
-    end;
-  end;
-
-  // ostatnia linia (bez entera na końcu)
-  if lineStart <= Length(text) then
-  begin
-    line := Copy(text, lineStart, Length(text) - lineStart + 1);
+    line := lines[lineIdx];
+    if line = '' then
+      Continue;
 
     m := measureCtx.measureText(line);
 
@@ -5586,16 +5583,20 @@ var
   key: String;
   v: JSValue;
   fontStr: String;
+  lines: TStringArray;
+  i: Integer;
+  w: Double;
 begin
+  if text = '' then Exit(0);
+
   if GTextWidthCache = nil then
     GTextWidthCache := TJSMap.new;
 
-  // Ustawiamy domyślny font Wilgi dla danego rozmiaru
-  EnsureFont(size);          // ustawia gCtx.font np. "16px 'Press Start 2P'"
+  EnsureFont(size);
   fontStr := gCtx.font;
 
-  // klucz do cache: font + tekst
-  key := fontStr + '|' + text;
+  // klucz do cache: font + tekst (z newline'ami)
+  key := fontStr + '|W|' + text;
 
   if GTextWidthCache.has(key) then
   begin
@@ -5603,12 +5604,19 @@ begin
     Exit(Double(v));
   end;
 
-  // Pomiar na ukrytym, zwykłym canvasie (zawsze w main-thread)
-  W_InitMeasureCanvas;                      // tworzy (jeśli trzeba) gMeasureCanvas + gMeasureCtx
-  gMeasureCtx.setTransform(1, 0, 0, 1, 0, 0); // na wszelki wypadek brak skalowania
-  gMeasureCtx.font := fontStr;              // ten sam font, co na gCtx
+  W_InitMeasureCanvas;
+  gMeasureCtx.setTransform(1, 0, 0, 1, 0, 0);
+  gMeasureCtx.font := fontStr;
 
-  Result := gMeasureCtx.measureText(text).width;
+  // newline: szerokość = max z linii
+  lines := W_SplitLines(text);
+  Result := 0;
+  for i := 0 to High(lines) do
+  begin
+    if lines[i] = '' then Continue;
+    w := gMeasureCtx.measureText(lines[i]).width;
+    if w > Result then Result := w;
+  end;
 
   {$ifdef HAS_SET_UNDERSCORE}
   GTextWidthCache.set_(key, Result);
@@ -5620,68 +5628,72 @@ end;
 function MeasureTextHeight(const text: String; size: Integer): Double;
 var
   key       : String;
-  v         : JSValue;
   fontStr   : String;
   measureCtx: TJSCanvasRenderingContext2D;
   m         : JSValue;
   ascent,
   descent   : Double;
+  lineBox   : Double;
+  lineHeight: Integer;
+  lines     : TStringArray;
+  lineCount : Integer;
 begin
+  if text = '' then Exit(0);
+
   if GTextHeightCache = nil then
     GTextHeightCache := TJSMap.new;
 
-  // 1) ustaw font dokładnie tak, jak przy rysowaniu
   EnsureFont(size);
   fontStr := gCtx.font;
 
-  // 2) wysokość zależy tylko od fontu (rodzaj+rozmiar)
+  // cache wysokości pojedynczej linii po foncie
   key := 'H|' + fontStr;
 
   if GTextHeightCache.has(key) then
+    lineBox := Double(GTextHeightCache.get(key))
+  else
   begin
-    v := GTextHeightCache.get(key);
-    Exit(Double(v));
+    W_InitMeasureCanvas;
+    measureCtx := gMeasureCtx;
+
+    measureCtx.setTransform(1, 0, 0, 1, 0, 0);
+    measureCtx.font := fontStr;
+
+    m := measureCtx.measureText('Hg');
+
+    asm
+      var mm = m;
+      if (mm) {
+        ascent  = (mm.actualBoundingBoxAscent  !== undefined)
+                  ? Number(mm.actualBoundingBoxAscent)
+                  : 0.80 * size;
+        descent = (mm.actualBoundingBoxDescent !== undefined)
+                  ? Number(mm.actualBoundingBoxDescent)
+                  : 0.30 * size;
+      } else {
+        ascent  = 0.80 * size;
+        descent = 0.30 * size;
+      }
+    end;
+
+    lineBox := Ceil(ascent) + Ceil(descent);
+    if lineBox <= 0 then
+      lineBox := Ceil(0.80 * size) + Ceil(0.30 * size);
+
+    {$ifdef HAS_SET_UNDERSCORE}
+    GTextHeightCache.set_(key, lineBox);
+    {$else}
+    GTextHeightCache.&set(key, lineBox);
+    {$endif}
   end;
 
-  // 3) ukryty canvas do pomiarów
-  W_InitMeasureCanvas;
-  measureCtx := gMeasureCtx;
+  // total dla tekstu wieloliniowego — musi matchować DrawText (size + size div 3)
+  lineHeight := size + size div 3;
+  lines := W_SplitLines(text);
+  lineCount := Length(lines);
+  if lineCount <= 0 then lineCount := 1;
 
-  measureCtx.setTransform(1, 0, 0, 1, 0, 0);
-  measureCtx.font := fontStr;
-
-  // 4) pomiar jak w wilga_text_cache, na "Hg"
-  ascent  := 0;
-  descent := 0;
-  m := measureCtx.measureText('Hg');
-
-  asm
-    var mm = m;
-    if (mm) {
-      ascent  = (mm.actualBoundingBoxAscent  !== undefined)
-                ? Number(mm.actualBoundingBoxAscent)
-                : 0.80 * size;
-      descent = (mm.actualBoundingBoxDescent !== undefined)
-                ? Number(mm.actualBoundingBoxDescent)
-                : 0.30 * size;
-    } else {
-      ascent  = 0.80 * size;
-      descent = 0.30 * size;
-    }
-  end;
-
-  // 5) tak jak w text-cache – zaokrąglamy osobno
-  Result := Ceil(ascent) + Ceil(descent);
-
-  // 6) fallback, jakby coś poszło bardzo źle
-  if Result <= 0 then
-    Result := Ceil(0.80 * size) + Ceil(0.30 * size); // = ~1.1 * size
-
-  {$ifdef HAS_SET_UNDERSCORE}
-  GTextHeightCache.set_(key, Result);
-  {$else}
-  GTextHeightCache.&set(key, Result);
-  {$endif}
+  Result := lineBox + (lineCount - 1) * lineHeight;
 end;
 
 procedure SetTextFont(const cssFont: String);
